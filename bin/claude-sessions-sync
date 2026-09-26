@@ -1,0 +1,2785 @@
+#!/usr/bin/env python3
+"""Keep the Claude Code session list identical across Claude Desktop accounts.
+
+WHAT IS SYNCED
+    Claude Desktop stores one session *index* per account:
+
+        ~/Library/Application Support/Claude/claude-code-sessions/
+            <accountUuid>/<orgUuid>/local_<id>.json
+
+    Each file is a small JSON record (title, working directory, cliSessionId,
+    lastActivityAt, ...). The record carries no account or organisation field,
+    so it is portable between stores verbatim. This tool copies those records
+    between stores, and nothing else.
+
+WHAT IS NEVER TOUCHED
+    Conversation content lives in
+
+        ~/.claude/projects/<encoded-cwd>/<cliSessionId>.jsonl
+
+    which is NOT account-scoped: every account on the machine already reads the
+    same transcripts. This tool never reads, writes, copies or backs up a
+    transcript. Only the small index files above are ever moved.
+
+HOW IT RESOLVES CONFLICTS
+    For each sessionId the copy with the largest `lastActivityAt` wins, and is
+    written to every store that lacks it or holds an older one. It is not a
+    one-way mirror: every store syncs with every other store.
+
+DELETION RULE -- OPT-IN, AND OFF BY DEFAULT
+    A deleted session leaves a marker file named `deleted_<uuid>` whose content
+    is a millisecond timestamp.
+
+    BY DEFAULT this tool never removes a record or a marker. It does not
+    unlink a record, it does not write or propagate a deletion marker, and it
+    does not clear a stale marker. A default run only ever ADDS a record to a
+    store that lacks it, or replaces a strictly older copy. Every serious bug
+    found in this tool has been in the deletion path, so the default is the
+    mode that cannot lose anything; propagating deletions is something you
+    ask for.
+
+    A default run still HONOURS each store's own marker: a session a store
+    deleted is not pushed back into that store. Since this mode may not clear
+    a marker either, it writes no record into a store that holds ANY marker
+    for that session, stale or not -- a record sitting next to a marker is the
+    combination that can hide the session, and no later default run could
+    repair it. So a session you delete in one account stays gone there and
+    survives in the others, and this mode never creates that pair itself (a
+    pair already on disk is left as it is; --propagate-deletions clears it).
+
+    --propagate-deletions turns the deletion path on. A session then counts as
+    deliberately deleted when a marker really exists AND its timestamp is at
+    least as new as the winning record's `lastActivityAt`; the record is
+    removed from every store and the marker is propagated everywhere. A marker
+    OLDER than the record is stale (the session was used again after being
+    deleted); it is never propagated, and a stale marker found next to a live
+    record is removed, because the app does not produce that combination
+    itself and it can hide the session. A marker is copied into other stores
+    only when NO store holds a file for that session any more: a file that
+    exists but could not be interpreted -- unparseable, a name that is not a
+    plain local_<id>, a body naming a different session -- blocks propagation,
+    because writing a marker next to a living record is precisely what hides
+    the session.
+
+    --no-delete is still accepted, as a deprecated no-op: it now describes the
+    default.
+
+    The one thing an applying run still removes is this tool's own temp file
+    -- one left behind by a run that was killed mid-write, or the one it has
+    just written itself when the last check before the rename says the write
+    must not happen. It is named exactly the way its writer names them,
+    `.sync-<pid>-local_<id>.json.tmp`, and is neither a record nor a marker.
+    Nothing else is swept, whatever its name.
+
+WHEN IN DOUBT, NOTHING HAPPENS
+    Every input here can be caught half-written, because the app rewrites these
+    files while this job runs. The rule is that an unreadable input means "skip
+    this one item this run", never "assume it was empty":
+
+      * a record file that will not parse, or that is not a JSON object, is
+        skipped -- as a source and as a destination. An unreadable destination
+        is never overwritten and never unlinked, so an older copy can never
+        clobber the newest one and a file nobody could read is never deleted.
+      * a deletion marker that exists but whose content is not a plausible
+        millisecond timestamp (empty, truncated mid-write, garbage) is treated
+        as unknown-but-present. The session is left completely alone for that
+        run: it is not resurrected, not deleted, and the marker is neither
+        copied nor removed. It is reported instead, because guessing either way
+        destroys data.
+      * a `deleted_<uuid>` entry that is not a plain regular file -- a
+        directory, a symlink, a fifo -- is the same case: it cannot be read as
+        a marker, but it is not "no marker" either. It is unknown-but-present,
+        so that session is left alone in every store (above all, no record is
+        written next to it), the entry itself is never touched, and it is
+        counted and reported. Index entries are only ever opened as regular
+        files, without following a symlink and without blocking on a fifo.
+      * a record with no usable `lastActivityAt` is never deleted -- neither
+        the winning copy nor another store's copy; if a marker exists for it,
+        it is skipped entirely, since the two cannot be compared. "Usable"
+        means a millisecond value from 2001 up to a day past this machine's
+        clock: a copy stamped further in the future is undatable too, so it
+        can never win and never overwrite the genuinely newest copy.
+      * a record with no `cliSessionId` names no Claude Code session, so there
+        is nothing for another account to resume: it is not copied, and it is
+        counted and reported rather than dropped in silence.
+      * a DESTINATION whose `lastActivityAt` is present but is not a plausible
+        millisecond value cannot be compared with anything either, so that
+        store's copy is left exactly as it is -- neither overwritten nor
+        unlinked. (A missing or null one stays overwritable: that is a record
+        with no opinion, not one we misread.)
+      * a DESTINATION whose `sessionId` field names a different session than
+        its file name may be that other session's only copy. It is never
+        overwritten and never unlinked, just as such a file is never used as a
+        source, and it is counted and reported.
+      * a directory that cannot be LISTED is not an empty store. The whole
+        store is dropped from the run and reported, because a store we cannot
+        enumerate cannot be proven to be in the backup either.
+
+    One damaged file can therefore never take the whole run down, and never
+    causes a deletion.
+
+BACKUPS
+    Before any run that would delete a record, propagate a deletion marker or
+    clear a stale one -- and before the very first apply on this machine --
+    every store's index files are copied to
+    ~/.claude/backups/claude-sessions-<YYYYmmdd-HHMMSS>/. Only
+    those index files are ever backed up, never a transcript. Each backup is
+    built in a `.partial` directory and renamed into place only when it is
+    complete, so a half-written backup is never offered for restoring. A backup
+    that does not actually contain every file this run could destroy -- each
+    record it would unlink, each stale marker it would clear -- counts as a
+    failed backup, and a failed backup means nothing is deleted on that run.
+    Any other file it cannot copy (one with no read permission, say) is left
+    out with a warning instead of failing the whole backup.
+
+    Retention is not a plain count. The newest 7 are kept, but nothing younger
+    than 24 hours is ever pruned, and of the backups taken before a deletion
+    (or before a --restore) the NEWEST 3 are kept regardless of how many other
+    backups pile up, plus the very first one. The newest ones are the copies
+    someone actually reaches for: a wrongly hidden session is noticed days
+    after the run that hid it, not months. The first one is the state before
+    this tool ever deleted anything. A destructive plan that keeps failing is
+    re-planned every minute, and a pure count would let those retries evict
+    the only copy of what was deleted. For the same
+    reason a new backup is not taken at all when the newest one is recent and
+    every index file still has the name, size and modification time it had
+    when that backup was written (contents are not compared); the existing one
+    is reused as the safety net for this run. (The
+    age floor has one limit: past 28 backups the oldest are pruned anyway, so
+    a day of churn cannot fill the disk. The protected pre-deletion backups
+    are still never among them -- at most 4, which is what the cap is for.)
+
+    --restore-list shows what is available. --restore <timestamp> copies a
+    backup back into the matching stores; it clears the deletion markers of the
+    sessions it brings back, so the next sync cannot immediately undo it, and
+    it first backs up the current state of every store it writes into or
+    clears a marker in -- a profile store the sync itself now skips included
+    -- so the restore itself is reversible. That safety backup never evicts
+    the backup being restored from, and a restore does not start at all if it
+    cannot be written or lacks a file the restore would overwrite or clear. A
+    store that cannot be listed is left alone, and a profile that no longer
+    exists is not recreated. A restore is a
+    rollback, so a record that is NEWER on disk than in the backup is replaced
+    by the older copy -- before copying anything it says how many records that
+    is, and names the first few. It never writes a backed-up marker into a
+    store that now holds a live record for that session, and never writes
+    through anything at a record's or marker's path that is not a regular file.
+    Nothing the backup does not know about is removed.
+
+IMPORTANT: WHEN CHANGES BECOME VISIBLE
+    Claude Desktop reads the session list only at startup and on account switch;
+    it does not watch the directory. Synced sessions therefore appear after a
+    restart or an account switch, not live in an already-open window.
+
+USAGE
+    claude-sessions-sync                      dry run, writes no session data
+    claude-sessions-sync --apply              synchronize now
+    claude-sessions-sync --apply --quiet      log only when something changed
+    claude-sessions-sync --apply --propagate-deletions   also apply deletions
+                                                         (opt-in)
+    claude-sessions-sync --no-delete          deprecated no-op: now the default
+    claude-sessions-sync --install [--every 1m]   install the background job
+    claude-sessions-sync --uninstall          remove the background job
+    claude-sessions-sync --status             interval, deletion mode, recent log
+    claude-sessions-sync --restore-list       list available backups
+    claude-sessions-sync --restore <stamp>    copy a backup back into the stores
+
+Duration units: s=seconds, m=minutes, h=hours, d=days. "20s", "1m", "1m30s",
+"2h", "30d" or a bare number of seconds. Case-insensitive; m means minutes, not
+months. launchd throttles anything below 10 seconds, so 10s is the floor.
+"""
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import stat as stat_mod
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+APP = os.path.join(HOME, "Library/Application Support/Claude")
+BASE = os.path.join(APP, "claude-code-sessions")
+# Extra Claude instances opened by `claude-multi <email>` run with their own
+# Electron --user-data-dir. Their session stores are synced too.
+PROFILES_ROOT = os.path.join(HOME, ".claude-profiles")
+LOGDIR = os.path.join(HOME, ".claude/logs")
+LOG = os.path.join(LOGDIR, "claude-sessions-sync.log")
+# launchd's StandardErrorPath is a SEPARATE file: launchd holds it open and
+# appends tracebacks to it, so this process must never rewrite the same file it
+# writes its own lines to.
+ERRLOG = os.path.join(LOGDIR, "claude-sessions-sync.err.log")
+LOCK = os.path.join(LOGDIR, "claude-sessions-sync.lock")
+BACKUP_ROOT = os.path.join(HOME, ".claude/backups")
+BACKUP_PREFIX = "claude-sessions-"
+PARTIAL_SUFFIX = ".partial"
+KEEP_BACKUPS = 7
+# Pre-deletion backups protected from pruning: the NEWEST this many, plus the
+# very first one. Protecting the oldest three instead meant the snapshots of
+# the most recent destructive runs -- the ones a user notices and wants to
+# undo -- were the first pre-deletion backups evicted, and so was the safety
+# backup every --restore takes. Capped, because an unprunable set must not be
+# able to grow without bound: at most KEEP_PRE_DELETE + 1 are protected.
+KEEP_PRE_DELETE = 3
+# Retention floors on top of the count. A backup is taken before EVERY
+# destructive run, and a destructive plan that cannot complete (an unlinkable
+# record, a read-only store) is re-planned by the background job every minute,
+# so KEEP_BACKUPS alone can be churned through in KEEP_BACKUPS minutes -- which
+# would evict exactly the backup holding what the first destructive run
+# removed. Nothing younger than MIN_BACKUP_AGE is pruned, and the protected
+# pre-deletion backups (see KEEP_PRE_DELETE) are never pruned at all.
+MIN_BACKUP_AGE = 24 * 3600
+# ... and a stuck destructive plan must not write a new backup every minute
+# either: an existing one taken this recently, over an index set whose names,
+# sizes and mtimes have not changed since (see backup_fingerprint), is the
+# same safety net.
+BACKUP_REUSE_AGE = 24 * 3600
+# The age floor has to yield to something, or a destructive plan that stays
+# stuck for a day while the stores keep changing would keep writing full
+# backups that nothing may prune. Above this many, the oldest are pruned even
+# when they are young -- but never a protected pre-deletion one, which is the
+# copy the floor exists to protect.
+HARD_MAX_BACKUPS = 4 * KEEP_BACKUPS
+# Bookkeeping files inside a backup directory. Both start with a dot, so
+# neither restore() nor restore_list() (which look only at local_*/deleted_*)
+# ever treats them as content.
+PRE_DELETE_MARK = ".pre-deletion"
+# uuid<TAB>email, maintained by bin/claude-multi. Used only to recognise a
+# profile directory this tool set manages; never parsed for anything else.
+ACCOUNTS_TSV = os.path.join(PROFILES_ROOT, "accounts.tsv")
+# A profile directory that is NOT in that registry has to prove it is still
+# live some other way: the APP must have written one of its own files in it
+# this recently. See is_live_profile() and profile_activity() for the rule.
+PROFILE_LIVE_AGE = 30 * 86400
+# Top-level entries of a profile directory that this tool set writes itself,
+# so their mtimes say nothing about whether the app still uses the profile:
+# the session tree, whose directories every sync write bumps, and the MCP
+# config bin/claude-multi may copy in when it creates a profile.
+NOT_APP_EVIDENCE = frozenset(("claude-code-sessions", "claude_desktop_config.json"))
+FINGERPRINT_FILE = ".fingerprint"
+MAIN_LOG = os.path.join(HOME, "Library/Logs/Claude/main.log")
+LABEL = "io.github.claude-multi.sync"
+PLIST = os.path.join(HOME, "Library/LaunchAgents", LABEL + ".plist")
+SCRIPT = os.path.abspath(__file__)
+MAX_LOG_LINES = 800
+MAX_ERRLOG_BYTES = 256 * 1024
+MAIN_LOG_TAIL_BYTES = 256 * 1024
+MIN_INTERVAL = 10  # launchd throttles anything shorter anyway
+
+# A deletion marker holds milliseconds. Anything below 10**12 (2001-09-09) is a
+# write we caught half-finished, not a real timestamp; anything above 10**14
+# (year 5138) is garbage. Both are treated as "unreadable", never as a value.
+MIN_MARKER_MS = 10 ** 12
+MAX_MARKER_MS = 10 ** 14
+# ... and so is anything more than a day ahead of this machine's clock, in a
+# record as much as in a marker. 10**14 alone let a copy stamped in the year
+# 2445 (a wrong system clock, a damaged value) win every newest-wins
+# comparison for ever and be written back over the user's genuinely newest
+# copy on every run; a marker stamped like that would delete its session
+# again every time it was used. The day of slack absorbs a clock that is
+# merely a little fast. Fixed once per process, so every comparison in one
+# run uses the same bound.
+FUTURE_SLACK_MS = 86400 * 1000
+LATEST_MS = min(MAX_MARKER_MS, int(time.time() * 1000) + FUTURE_SLACK_MS)
+MARKER_RE = re.compile(r"^(\d+)(?:\.\d+)?$")
+
+# Records are published with an atomic rename from a temp file in the same
+# directory. The name is hidden, unique per process and does not end in the
+# ".json" the app looks for, and stale ones are swept at the start of each
+# applying run, so a killed process cannot leave something the app might read.
+TMP_PREFIX = ".sync-"
+TMP_SUFFIX = ".tmp"
+STRAY_TMP_AGE = 300
+# The exact shape the writer produces: TMP_PREFIX, the writing pid, the record
+# name it stands in for, TMP_SUFFIX. The sweep removes this and nothing else --
+# not a `local_*.tmp`, not anything else that merely starts with the prefix --
+# because it is the one unlink every applying run does, the default included.
+TMP_RE = re.compile(r"^%s\d+-local_[A-Za-z0-9_.-]+\.json%s$"
+                    % (re.escape(TMP_PREFIX), re.escape(TMP_SUFFIX)))
+
+# Backups and logs contain session titles and working-directory paths.
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+QUIET = False
+
+UNITS = {"S": 1, "M": 60, "H": 3600, "D": 86400}
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def parse_interval(text):
+    """'20s', '1m', '1m30s', '2h', '30d' or bare seconds ('90') -> seconds.
+
+    Case-insensitive. Anything else is rejected rather than guessed at.
+    """
+    s = str(text).strip().replace(" ", "").upper()
+    if not s:
+        raise ValueError("empty duration")
+    if s.isdigit():
+        total = int(s)
+    else:
+        parts = re.findall(r"(\d+)\s*([SMHD])", s)
+        if not parts or "".join(a + b for a, b in parts) != s:
+            raise ValueError(
+                "cannot parse duration: %s  (examples: 20s, 1m, 1m30s, 2h, 30d)" % text)
+        total = sum(int(n) * UNITS[u] for n, u in parts)
+    if total <= 0:
+        raise ValueError("duration must be greater than zero")
+    return total
+
+
+def human(sec):
+    for unit, name in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if sec % unit == 0 and sec >= unit:
+            n = sec // unit
+            return "%d %s%s" % (n, name, "" if n == 1 else "s")
+    return "%d second%s" % (sec, "" if sec == 1 else "s")
+
+
+def ms(value):
+    """A millisecond timestamp out of an arbitrary JSON value; 0 when unusable.
+
+    Records are written by other programs, so `lastActivityAt` may be missing,
+    null, a string or something else entirely. Everything that is not a usable
+    number becomes 0, which callers must read as "unknown" -- never as "old".
+
+    A number that IS there but cannot be milliseconds is unusable too, and this
+    is the same window read_marker() enforces on markers. Seconds (1.7e9) would
+    compare older than every marker and make each one look decisive; micro- or
+    nanoseconds, or a 25-digit string from a half-written file, would win every
+    newest-wins comparison forever and be copied over the genuinely newest copy
+    in every store. Both become 0 = unknown, which plan() handles by leaving
+    the session alone rather than guessing. The upper end of the window is
+    LATEST_MS -- a day past this machine's clock -- and not merely the year
+    5138: a copy stamped far in the future is undatable in exactly the same
+    way, so it never wins a comparison and, as a destination, is left alone.
+    """
+    if isinstance(value, bool):
+        v = 0
+    elif isinstance(value, int):
+        v = value
+    elif isinstance(value, float):
+        try:
+            v = int(value)  # NaN and the infinities raise here
+        except (ValueError, OverflowError):
+            v = 0
+    elif isinstance(value, str):
+        m = MARKER_RE.match(value.strip())
+        try:
+            v = int(m.group(1)) if m else 0
+        except ValueError:
+            v = 0
+    else:
+        v = 0
+    return v if MIN_MARKER_MS <= v <= LATEST_MS else 0
+
+
+def chmod_quiet(path, mode):
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def log(msg, force=False):
+    # --quiet means "say nothing unless something happened": in quiet mode a
+    # non-forced message is not printed AND not written, otherwise the
+    # background job would add a line to the log on every single run.
+    if QUIET and not force:
+        return
+    line = "%s  %s" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    if not QUIET or force:
+        print(line if QUIET else msg)
+    try:
+        os.makedirs(LOGDIR, exist_ok=True)
+        chmod_quiet(LOGDIR, DIR_MODE)
+        # UTF-8 whatever the locale: a path in the line may not be ASCII.
+        with open(LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        chmod_quiet(LOG, FILE_MODE)
+    except Exception:
+        pass
+
+
+_WARNED = set()
+
+
+def warn_once(key, msg):
+    """Log a diagnosis about the machine's layout at most once per run.
+
+    Not forced: the background job runs every minute and a permanently parked
+    profile directory would otherwise add a line to the log 1440 times a day.
+    An interactive run (and therefore the dry run) prints it.
+    """
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    log(msg)
+
+
+def trim_log():
+    """Keep both logs bounded. Called at the end of EVERY run, including runs
+    that changed nothing: a job that only ever fails still appends to the error
+    log, and that is exactly the case the cap exists for."""
+    try:
+        with open(LOG, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        if len(lines) > MAX_LOG_LINES:
+            with open(LOG, "w", encoding="utf-8") as fh:
+                fh.writelines(lines[-MAX_LOG_LINES // 2:])
+            chmod_quiet(LOG, FILE_MODE)
+    except Exception:
+        pass
+    # ERRLOG belongs to launchd (StandardErrorPath). We never write lines to
+    # it, we only cap its size; launchd appends, so it cannot lose a line to a
+    # hole, at worst a line written during this rewrite is dropped.
+    try:
+        size = os.path.getsize(ERRLOG)
+        if size > MAX_ERRLOG_BYTES:
+            with open(ERRLOG, "rb") as fh:
+                fh.seek(size - MAX_ERRLOG_BYTES // 2)
+                tail = fh.read()
+            with open(ERRLOG, "wb") as fh:
+                fh.write(tail)
+            chmod_quiet(ERRLOG, FILE_MODE)
+    except Exception:
+        pass
+
+
+class Lock:
+    """Single-run lock held with flock(2).
+
+    The kernel drops the lock when this process exits however it exits, so
+    there is no staleness heuristic to tune and no way to release -- or delete
+    -- a lock that belongs to another run. The lock FILE is never unlinked for
+    the same reason: the lock is the open descriptor, not the directory entry.
+    """
+
+    fd = None
+
+    def __enter__(self):
+        os.makedirs(LOGDIR, exist_ok=True)
+        chmod_quiet(LOGDIR, DIR_MODE)
+        fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, FILE_MODE)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            other = ""
+            try:
+                other = os.read(fd, 32).decode("utf-8", "ignore").strip()
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            # Exit 0: colliding with the every-minute background job is normal
+            # and must not show up as a failed run in `launchctl print`. Say so
+            # out loud in an interactive run, though, so it cannot be mistaken
+            # for "synced, nothing to do". The background job stays silent.
+            if not QUIET:
+                log("another run is already in progress%s -- nothing was done."
+                    % (" (pid %s)" % other if other else ""))
+            raise SystemExit(0)
+        self.fd = fd
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, str(os.getpid()).encode())
+        except OSError:
+            pass
+        return self
+
+    def __exit__(self, *a):
+        if self.fd is None:
+            return
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        self.fd = None
+
+
+# --------------------------------------------------------------------------
+# store discovery
+# --------------------------------------------------------------------------
+
+_ACTIVE_STORE_CACHE = ()  # () = not computed yet, (value,) = computed
+
+
+def active_store():
+    """The <accountUuid>/<orgUuid> directory the app is using right now, taken
+    from the last initialization line in the desktop app's main.log.
+
+    main.log routinely reaches tens of megabytes and this job runs every
+    minute, so only the tail is read, and the answer is computed once per
+    process."""
+    global _ACTIVE_STORE_CACHE
+    if _ACTIVE_STORE_CACHE:
+        return _ACTIVE_STORE_CACHE[0]
+    found = None
+    try:
+        with open(MAIN_LOG, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - MAIN_LOG_TAIL_BYTES))
+            tail = fh.read().decode("utf-8", "ignore").splitlines()
+        for line in reversed(tail):
+            m = re.search(
+                r"Initialization succeeded.*?accountId=([0-9a-fA-F-]+),\s*orgId=([0-9a-fA-F-]+)",
+                line)
+            if m:
+                p = os.path.join(BASE, m.group(1), m.group(2))
+                found = p if os.path.isdir(p) else None
+                break
+    except Exception:
+        found = None
+    _ACTIVE_STORE_CACHE = (found,)
+    return found
+
+
+# Words people append when they park a copy of a directory, plus whatever
+# stamp they add after them ("...bak-20260101", "... copy 2", "...old.save").
+PARKED_WORDS = ("bak", "backup", "backups", "old", "orig", "original", "save",
+                "saved", "copy", "prev", "previous", "disabled", "unused",
+                "archive", "archived", "snapshot")
+# Anchored at the END and only after a separator, NOT "anywhere in the name":
+# a profile is named after an e-mail address, and one legitimately called
+# something like x.bak@example.com must keep syncing -- bin/claude-multi makes
+# the same distinction for the same reason.
+PARKED_RE = re.compile(
+    r"[.\-_ ](?P<word>%s)(?:[.\-_ ][0-9A-Za-z]{1,20})*$"
+    % "|".join(PARKED_WORDS),
+    re.IGNORECASE)
+# A complete address (local part, '@', a domain ending in a TLD-shaped label),
+# and the rest of a domain after one of its labels. See is_snapshot_name().
+ADDRESS_RE = re.compile(
+    r"^[^@\s]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
+DOMAIN_TAIL_RE = re.compile(r"^(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
+
+
+def is_snapshot_name(name):
+    """True for a name that is a parked copy rather than something live.
+
+    The same test is applied to profile, account and org directories:
+    "work@example.com.bak-20260101", "work@example.com copy 2",
+    "personal@example.com.old", a trailing "~". Only ".bak" used to be
+    recognised, so every other way of parking a directory was still folded
+    into the sync -- and into the global deletion maximum.
+
+    In a name holding an address, a parked word that is merely a label of the
+    DOMAIN does not count: me@mail.archive.org and dev@team.snapshot.dev are
+    live profiles. The word counts when a complete address comes before it
+    (work@example.com.old), or when what follows it is not the rest of a
+    domain (me@mail.bak-2026, or a later label that is itself a parked word).
+    In doubt it stays a parked copy: skipping a live profile is reported,
+    syncing into a snapshot is not recoverable.
+    """
+    if name.endswith("~"):
+        return True
+    if "@" not in name:
+        return bool(PARKED_RE.search(name))
+    for i in range(len(name)):
+        m = PARKED_RE.match(name, i)
+        if not m:
+            continue
+        tail = name[m.end("word"):]
+        if (ADDRESS_RE.match(name[:i]) or name[i] not in ".-"
+                or not DOMAIN_TAIL_RE.match(tail)
+                or any(lbl.lower() in PARKED_WORDS for lbl in tail.split("."))):
+            return True
+    return False
+
+
+_REGISTERED_CACHE = ()
+
+
+def registered_profiles():
+    """The profile directory names bin/claude-multi knows about.
+
+    accounts.tsv is `uuid<TAB>name`, written by `claude-multi list` (and by
+    `setup`, which ends by running it), which is where bin/claude-multi
+    learns which account each e-mail-named, signed-in profile holds (opening
+    a profile does not write it); the name column is
+    the directory name under ~/.claude-profiles. Read once per process, and
+    treated as additive evidence only: a missing or unreadable registry means
+    "no extra confidence", never "nothing is live".
+    """
+    global _REGISTERED_CACHE
+    if _REGISTERED_CACHE:
+        return _REGISTERED_CACHE[0]
+    names = set()
+    try:
+        with open(ACCOUNTS_TSV, encoding="utf-8", errors="replace") as fh:
+            for line in fh.read(256 * 1024).splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[1].strip():
+                    names.add(parts[1].strip())
+    except OSError:
+        pass
+    _REGISTERED_CACHE = (names,)
+    return names
+
+
+def profile_activity(pdir):
+    """Newest mtime of anything the APP itself writes in a profile directory.
+
+    Only evidence this tool cannot manufacture counts. Every record this tool
+    writes lands in claude-code-sessions/ with rename(2), which bumps those
+    directories' mtimes -- so measuring them, as this once did, meant the
+    tool's own writes kept an abandoned profile "written to recently" for
+    ever, and PROFILE_LIVE_AGE could never demote it once the first sync had
+    written into it.
+
+    What is measured instead is the profile's own top-level app state:
+    config.json, Local State, Preferences, Cookies, Network Persistent State
+    and the rest of the Electron user-data entries, which a running instance
+    rewrites and which nothing in this tool set ever touches. NOT_APP_EVIDENCE
+    names the two top-level entries this tool set does write; hidden names
+    (.DS_Store and the like) are not the app's either. lstat, so a symlink
+    cannot lend the profile another file's age, and not the profile
+    directory's own mtime, which creating the session tree inside it bumps.
+    """
+    newest = 0.0
+    for name in scan_names(pdir):
+        if name.startswith(".") or name in NOT_APP_EVIDENCE:
+            continue
+        try:
+            newest = max(newest, os.lstat(os.path.join(pdir, name)).st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def is_live_profile(name):
+    """(is_live, reason, remedy) for ~/.claude-profiles/<name>.
+
+    THE RULE -- a profile directory is a live store only when all of:
+
+      1. the name is not hidden and does not look like a parked copy
+         (see is_snapshot_name);
+      2. the directory really is an Electron user-data directory: it holds the
+         app's own config.json, which is what bin/claude-multi reads to find
+         out which account a profile is signed in to. A directory that merely
+         contains a claude-code-sessions tree someone copied out of a profile
+         is not a profile;
+      3. it is registered in ~/.claude-profiles/accounts.tsv -- which
+         `claude-multi list` refreshes from every e-mail-named, signed-in
+         profile; opening a profile does NOT write it -- OR the app itself has
+         written one of its own files in it within PROFILE_LIVE_AGE (see
+         profile_activity(): this tool's own writes do not count).
+
+    Anything else is a frozen copy as far as this tool is concerned. Its
+    deletion markers are old decisions the live stores may already have
+    undone, so folding them into the global maximum would delete a session
+    that is alive everywhere; and writing records into what the user believes
+    is a snapshot destroys the very thing they kept it for. Such a directory
+    is therefore not read, not counted and never written to, and the run says
+    so once, naming it and the remedy. An unregistered profile that has
+    simply been idle for a month comes back as soon as the app writes to it
+    again -- open it once with `claude-multi <email>` -- and `claude-multi list`
+    registers it in accounts.tsv when its name is an e-mail address and it is
+    signed in, after which its age no longer matters.
+    """
+    if name.startswith("."):
+        return False, "hidden directory", ""
+    if is_snapshot_name(name):
+        return False, "the name looks like a parked copy", ""
+    pdir = os.path.join(PROFILES_ROOT, name)
+    if not os.path.isfile(os.path.join(pdir, "config.json")):
+        return (False, "no config.json, so it is not an app profile directory",
+                "")
+    if name in registered_profiles():
+        return True, "registered in accounts.tsv", ""
+    age = time.time() - profile_activity(pdir)
+    if age > PROFILE_LIVE_AGE:
+        return (False,
+                "not in accounts.tsv, and the app has not written to it for "
+                "%d days" % int(age // 86400),
+                "if you still use it, run `claude-multi list` to register it "
+                "(an e-mail-named, signed-in profile), or open it once")
+    return True, "the app wrote to it recently", ""
+
+
+def bases():
+    """The main profile's store root plus every extra profile's store root.
+
+    A parked copy of a profile (`personal.bak-20260101/`) is skipped here, not
+    only at the account and org level below it. Such a copy is frozen: its
+    deletion markers are old decisions the live stores may already have undone,
+    and folding them into the global maximum would delete a session that is
+    alive everywhere -- while the sync wrote records into what the user
+    believes is a snapshot.
+    """
+    out = [BASE]
+    names = list_dir(PROFILES_ROOT)
+    if names is None:
+        # Missing is normal (no extra profiles). Present but unlistable means
+        # the extra profiles are simply not synced this run, which is the safe
+        # direction -- nothing there is read, written or counted.
+        if os.path.exists(PROFILES_ROOT):
+            warn_once("profiles-root", "WARNING %s cannot be listed, so no "
+                      "profile is synced this run" % PROFILES_ROOT)
+        return out
+    for name in names:
+        p = os.path.join(PROFILES_ROOT, name, "claude-code-sessions")
+        if not os.path.isdir(p):
+            continue
+        live, why, remedy = is_live_profile(name)
+        if not live:
+            warn_once("profile:" + name,
+                      "skipping %s (%s): it is not read, not written, and its "
+                      "deletion markers are ignored%s"
+                      % (os.path.join(PROFILES_ROOT, name), why,
+                         " -- " + remedy if remedy else ""))
+            continue
+        out.append(p)
+    return out
+
+
+def label(p):
+    """Readable name for reports: 'main:<acct8>' or '<profile>:<acct8>'."""
+    acct = os.path.basename(os.path.dirname(p))[:8]
+    who = "main"
+    if p.startswith(PROFILES_ROOT + os.sep):
+        who = p[len(PROFILES_ROOT) + 1:].split(os.sep)[0]
+    return "%s:%s" % (who, acct)
+
+
+# A record's file NAME is its identity (see scan()), so every name that is
+# treated as a record has to be a plain `local_<id>` with nothing in it that
+# could travel into a path: no separator, no "..", nothing to interpret.
+RECORD_STEM_RE = re.compile(r"^local_[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
+
+
+def is_record_name(name):
+    """True for a session record the app actually reads.
+
+    ".bak" is excluded: the desktop app keeps its own `local_<id>.bak.json`
+    copies next to the live records. They sort before the live name, so on
+    equal timestamps a stale snapshot would win and be written over every
+    store, and one without a sessionId of its own would be propagated as a
+    phantom session that no deleted_<id> marker can ever match. count_sessions()
+    in bin/claude-multi excludes the same names for the same reason.
+    """
+    return (name.startswith("local_") and name.endswith(".json")
+            and ".bak" not in name)
+
+
+def stat_ident(path):
+    """(inode, size, mtime_ns) for a file, or None when it is not there.
+
+    This is the identity a destination had when the plan was made. Everything
+    destructive re-checks it immediately before acting, because minutes can
+    pass between plan and apply (a stray-temp sweep and a full backup run in
+    between) and the app writes to the live store the whole time.
+
+    lstat: the identity is that of the directory entry itself, so a symlink
+    swapped in after the plan does not pass for the file it points at.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def list_dir(path):
+    """Sorted entry names of a directory, or None when it cannot be LISTED.
+
+    None is not "empty", and the difference decides whether data can be lost.
+    A directory with search but no read permission -- or one replaced while
+    the run was thinking -- still answers os.path.exists() and open(), so a
+    caller that reads an empty listing as "this store holds nothing" will
+    happily write into it, unlink from it, and believe a backup that copied
+    none of it. Every caller that is about to write, delete or back up must
+    therefore handle None by dropping the directory from the run.
+
+    os.scandir rather than glob: a profile name or a HOME containing '[' turns
+    a glob pattern into a character class and silently matches nothing."""
+    try:
+        with os.scandir(path) as it:
+            return sorted(e.name for e in it)
+    except OSError:
+        return None
+
+
+def scan_names(path):
+    """Sorted entry names; [] when the directory cannot be listed.
+
+    Only for callers where "empty" and "unreadable" lead to the same harmless
+    decision: discovering candidate stores (an unlistable one is simply not
+    discovered) and sweeping our own temp files. Anything that decides about
+    deleting, overwriting or backing up uses list_dir() and handles None."""
+    names = list_dir(path)
+    return [] if names is None else names
+
+
+def store_contents(path):
+    """(has_record, has_marker) for a candidate store directory."""
+    has_rec = has_mark = False
+    for name in scan_names(path):
+        if is_record_name(name):
+            has_rec = True
+        elif name.startswith("deleted_"):
+            has_mark = True
+        if has_rec and has_mark:
+            break
+    return has_rec, has_mark
+
+
+def record_count(path):
+    return sum(1 for name in scan_names(path) if is_record_name(name))
+
+
+def stores():
+    """Stores to sync: directories holding session records or deletion markers,
+    plus every profile directory even when empty, plus whatever the app is
+    using right now."""
+    out = []
+    for base in bases():
+        if not os.path.isdir(base):
+            continue
+        # A freshly signed-in profile has an EMPTY store directory. If we
+        # required records there it would never get populated and that profile
+        # would show an empty sidebar forever. The main store, on the other
+        # hand, accumulates empty cross directories from account switches --
+        # those are not stores, so there we keep the "has content" condition.
+        # A directory holding only deletion markers IS content: its markers
+        # must be read, and it must stay eligible to be repopulated.
+        is_profile = base.startswith(PROFILES_ROOT + os.sep)
+        accts = list_dir(base)
+        if accts is None:
+            # Not discovered is safe -- an undiscovered store is never read,
+            # written or deleted from -- but it is not silent: a sidebar that
+            # stops being synced has to have a visible reason.
+            warn_once("base:" + base, "WARNING %s cannot be listed, so no "
+                      "store under it is synced this run" % base)
+            continue
+        for acct in accts:
+            ap = os.path.join(base, acct)
+            if not os.path.isdir(ap) or is_snapshot_name(acct):
+                continue
+            orgs = list_dir(ap)
+            if orgs is None:
+                warn_once("acct:" + ap, "WARNING %s cannot be listed, so no "
+                          "store under it is synced this run" % ap)
+                continue
+            for org in orgs:
+                op = os.path.join(ap, org)
+                if not os.path.isdir(op) or is_snapshot_name(org):
+                    continue
+                if not is_profile and list_dir(op) is None:
+                    # store_contents() cannot tell this from an empty cross
+                    # directory, so it would drop out without a word. Not
+                    # discovered is the safe direction, but say so. (The
+                    # active store is appended below whatever happens here,
+                    # and scan() reports it.)
+                    if op != active_store():
+                        warn_once("store:" + op, "WARNING %s cannot be listed, "
+                                  "so it is not synced this run" % op)
+                    continue
+                if is_profile or any(store_contents(op)):
+                    out.append(op)
+    act = active_store()
+    if act and act not in out:
+        out.append(act)
+    return out
+
+
+# --------------------------------------------------------------------------
+# reading index files
+# --------------------------------------------------------------------------
+
+def read_regular(path, limit=-1):
+    """The bytes of `path` when it is a plain regular file, else None.
+
+    Index files live in directories other programs write to, so the name
+    alone promises nothing about what is behind it. A fifo would block a
+    plain open() for ever -- holding the run lock, so every later run would
+    report "already in progress" and the background job would stop syncing
+    -- and a symlink would make this tool read, back up or overwrite a file
+    outside the store. So: O_NOFOLLOW (a symlink fails to open), O_NONBLOCK
+    (a fifo opens at once instead of waiting for a writer), and fstat on the
+    descriptor that was actually opened, which must be a regular file.
+    """
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat_mod.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks, left = [], limit
+        while left != 0:
+            chunk = os.read(fd, 65536 if left < 0 else min(left, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if left > 0:
+                left -= len(chunk)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def is_regular_entry(path):
+    """True when `path` itself (not what a symlink points at) is a regular file."""
+    try:
+        return stat_mod.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def load_record(path):
+    """The JSON object in a record file, or None when it cannot be used.
+
+    None means "unknown", never "empty": the caller must skip the file, not
+    treat it as a record with no fields. A record caught mid-write fails to
+    parse, a file holding a valid JSON non-object (null, a list, a number)
+    would raise later on .get(), and an entry that is not a regular file (see
+    read_regular) cannot be a record -- all of them land here."""
+    raw = read_regular(path)
+    if raw is None:
+        return None
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    return d
+
+
+def names_other_session(rec, sid):
+    """True when a record's `sessionId` field names a session other than
+    `sid`, the one its file name says it is (see scan())."""
+    inner = rec.get("sessionId")
+    return isinstance(inner, str) and bool(inner) and inner != sid
+
+
+def read_marker(path):
+    """(timestamp, ok) for a deletion marker.
+
+    ok is False when the file exists but its content is not a plausible
+    millisecond timestamp -- empty, truncated mid-write ('17893'), garbage,
+    or more than a day in this machine's future (see LATEST_MS).
+    Those must never be folded in as 0: 0 compares older than every record and
+    would resurrect a session the user just deleted. An entry that is not a
+    regular file is not readable as a marker either (see read_regular)."""
+    data = read_regular(path, 64)
+    if data is None:
+        return 0, False
+    raw = data.decode("utf-8", "ignore").strip()
+    m = MARKER_RE.match(raw)
+    if not m:
+        return 0, False
+    try:
+        t = int(m.group(1))
+    except ValueError:
+        return 0, False
+    if not (MIN_MARKER_MS <= t <= LATEST_MS):
+        return 0, False
+    return t, True
+
+
+# --------------------------------------------------------------------------
+# scan / plan / apply
+# --------------------------------------------------------------------------
+
+def scan(paths):
+    """recs:       sid -> (newest record, source path)
+       dels:       sid -> newest usable deletion timestamp across all stores
+       local_dels: (store, sid) -> that store's own usable deletion timestamp
+       unclear:    sids that have a marker somewhere which cannot be read
+       seen:       store -> the index file names that store held during the scan
+       sskip:      counts of record files deliberately not used as a source
+       bad:        stores whose directory could not be LISTED at all
+
+    A session id here is the record's FILE NAME stem and nothing else. The
+    name is what the app looks a session up by, it is what the marker files
+    are named after, and it is what every destination path in plan() is built
+    from -- so keying on the `sessionId` field inside the file would let a
+    record whose body disagrees with its own name be written over a DIFFERENT
+    session's file in every store, destroying that session's only copy. The
+    field is therefore a consistency check only: when it is present, is a
+    string and contradicts the name, the file is ambiguous and is skipped as a
+    source (and counted), exactly like a record that will not parse.
+
+    A store whose directory cannot be LISTED is not an empty store: it
+    contributes nothing at all -- no record, no marker, not even a `seen`
+    entry -- and comes back in `bad` so the caller can drop it from the run
+    before anything is planned for it. Returning [] for it would be actively
+    dangerous: os.path.exists() and open() still work on a directory that has
+    search but not read permission, so plan() would go on writing into it and
+    unlinking from it while the backup, which can only copy what it can
+    enumerate, silently covered none of it.
+
+    `seen` is also what makes marker propagation safe: it is every index file
+    name the store really held, including the ones that were NOT usable as a
+    source. A record can drop out of `recs` for several non-fatal reasons, and
+    "not in recs" must never be read as "no such file anywhere".
+
+    Only usable values go into dels/local_dels, so a timestamp of 0 there
+    always means "no marker in that store", never "a marker we could not
+    read" -- that case is carried by `unclear` instead. Any file that cannot
+    be parsed is skipped; no single damaged file may abort the run.
+
+    A `deleted_<uuid>` ENTRY that is not a regular file -- a directory, a
+    symlink (dangling or not), a fifo -- is exactly such a marker: something
+    is there under the marker's name and it cannot be read as one. It goes
+    into `unclear` like unreadable content does, and into `here`, and is
+    counted. Skipping it as "not a marker at all" is what let the default
+    mode write a record next to it, which is the one pair that mode promises
+    never to create.
+    """
+    recs, dels, local_dels, unclear = {}, {}, {}, set()
+    seen, bad = {}, []
+    sskip = {"name": 0, "sid": 0, "clock": 0, "unreadable": 0, "nocli": 0,
+             "markertype": 0}
+    for p in paths:
+        names = list_dir(p)
+        if names is None:
+            bad.append(p)
+            continue
+        here = set()
+        for b in names:
+            f = os.path.join(p, b)
+            if b.startswith("deleted_"):
+                here.add(b)
+                sid = "local_" + b[len("deleted_"):]
+                if not is_regular_entry(f):
+                    # Present, and not readable as a marker: unknown, never
+                    # "absent". The session is left alone everywhere.
+                    unclear.add(sid)
+                    sskip["markertype"] += 1
+                    continue
+                t, ok = read_marker(f)
+                if not ok:
+                    unclear.add(sid)
+                    continue
+                dels[sid] = max(dels.get(sid, 0), t)
+                local_dels[(p, sid)] = max(local_dels.get((p, sid), 0), t)
+            elif is_record_name(b):
+                here.add(b)
+                sid = b[:-len(".json")]
+                if not RECORD_STEM_RE.match(sid):
+                    # Not a plain local_<id>. It would be joined onto every
+                    # store path, so it is never a source and never a target.
+                    # It stays in `here`, though: the file exists, so no
+                    # deletion marker may be propagated for that session.
+                    sskip["name"] += 1
+                    continue
+                d = load_record(f)
+                if d is None:
+                    # The app may be mid-write; picked up on the next run.
+                    # Counted, because the docs promise every file that could
+                    # not be read is reported.
+                    sskip["unreadable"] += 1
+                    continue
+                if not d.get("cliSessionId"):
+                    # No Claude Code session behind this record: there is
+                    # nothing for another account to resume. Not an error, but
+                    # it is reported, or a session that never propagates has
+                    # no visible reason why.
+                    sskip["nocli"] += 1
+                    continue
+                inner = d.get("sessionId")
+                if isinstance(inner, str) and inner and inner != sid:
+                    # Body and name name two different sessions. Which one this
+                    # file is cannot be decided here, and guessing writes it
+                    # over the other one everywhere. Leave it alone entirely.
+                    sskip["sid"] += 1
+                    continue
+                la = ms(d.get("lastActivityAt"))
+                if la <= 0 and d.get("lastActivityAt") is not None:
+                    # Present but not a plausible millisecond value. Kept as a
+                    # source for stores that have no copy at all, but it can
+                    # never win a comparison, so it can never overwrite one.
+                    sskip["clock"] += 1
+                cur = recs.get(sid)
+                if not cur or la > ms(cur[0].get("lastActivityAt")):
+                    recs[sid] = (d, f)
+        seen[p] = here
+    return recs, dels, local_dels, unclear, seen, sskip, bad
+
+def plan(paths, recs, dels, local_dels, unclear, seen, do_delete):
+    """Work out what to write, remove, mark and clear.
+
+    Returns (writes, removes, marks, stale, skipped), where `skipped` counts
+    the items deliberately left alone because something could not be read.
+
+    `do_delete` is False unless --propagate-deletions was given. In that
+    default mode `removes`, `marks` and `stale` all come back empty: this
+    function may then only add a record to a store that lacks it, or replace a
+    strictly older copy, and it leaves any store that holds a marker for the
+    session completely alone.
+
+    Every destination that is going to be written or unlinked is recorded with
+    the identity it had while it was being read (see stat_ident). The apply
+    step re-checks that identity right before it acts: the two are separated by
+    a stray-temp sweep and a full backup, and the app keeps writing to the
+    store it has open the whole time.
+    """
+    writes, removes, marks, stale = [], [], [], []
+    skipped = {"marker": 0, "dest": 0, "destclock": 0, "destsid": 0,
+               "timestamp": 0, "changed": 0, "propagate": 0, "pair": 0}
+
+    # Every session id that some store holds a `local_<sid>.json` file for,
+    # whatever scan() then decided to do with that file. `recs` is NOT that
+    # set: a record drops out of it when its stem is not a plain local_<id>,
+    # when its body names a different session, when it will not parse, or
+    # when it has no cliSessionId. Marker propagation below consults THIS set,
+    # because a marker written next to a record that is on disk is exactly the
+    # pair that hides a session -- and nothing ever clears it again, since the
+    # stale-marker pass only iterates `recs`.
+    on_disk = set()
+    for names in seen.values():
+        for n in names:
+            if n.startswith("local_") and n.endswith(".json"):
+                on_disk.add(n[:-len(".json")])
+    # sid -> stores where a record for a dead session is still on disk after
+    # this plan, because its removal had to be postponed. No marker may be
+    # written into those either.
+    held = {}
+
+    for sid, (best, src) in sorted(recs.items()):
+        la = ms(best.get("lastActivityAt"))
+        mt = dels.get(sid)
+
+        if sid in unclear:
+            # A marker for this session exists somewhere but cannot be read.
+            # Unknown-but-present: copying the record back would resurrect a
+            # session the user just deleted, and deleting on a guess would
+            # destroy a live one. Leave the session entirely alone this run and
+            # report it. (A later run reads the finished marker and decides.)
+            skipped["marker"] += 1
+            continue
+        if mt is not None and la <= 0:
+            # A marker exists but the record has no usable timestamp, so the
+            # two cannot be compared. Never delete on that; never copy either.
+            skipped["timestamp"] += 1
+            continue
+
+        # A record is deleted only when a marker REALLY exists and is at least
+        # as new as a usable lastActivityAt. "No marker" must never read as 0
+        # and match a record whose timestamp is missing.
+        dead = do_delete and mt is not None and la > 0 and mt >= la
+
+        for p in paths:
+            dst = os.path.join(p, sid + ".json")
+            # lexists: a dangling symlink under the record's name is still
+            # something on disk. load_record() refuses it below, so it is
+            # left alone as an unreadable destination, never replaced.
+            exists = os.path.lexists(dst)
+            lt = local_dels.get((p, sid), 0)
+
+            if not do_delete and lt > 0:
+                # Deletion propagation is off, so this run may not unlink a
+                # marker either. Writing the record into a store that holds ANY
+                # marker for it -- its own deletion, or one that is merely
+                # stale -- would leave record and marker side by side, which is
+                # the combination that can hide the session, and no later
+                # default run could repair it. Leave this store alone.
+                # (Cheap check first: no need to read a destination we are not
+                # going to touch.)
+                continue
+
+            # Whatever happens next -- a write or a delete -- depends on what
+            # this store actually holds, so read it now, and remember exactly
+            # which bytes the decision was made about.
+            old = {}
+            ident = None
+            if exists:
+                before = stat_ident(dst)
+                loaded = load_record(dst)
+                if loaded is None:
+                    # The destination is being rewritten right now, or is
+                    # damaged. Treating it as an empty record would let an
+                    # older copy overwrite the newest one and would throw away
+                    # the target's own bridgeSessionIds; deleting it would
+                    # throw away a file we cannot even read. Skip this store
+                    # for this session; the next run sees the finished file.
+                    skipped["dest"] += 1
+                    if dead:
+                        held.setdefault(sid, set()).add(p)
+                    continue
+                ident = stat_ident(dst)
+                if ident is None or ident != before:
+                    # It changed while it was being read, so `loaded` may be
+                    # neither the old nor the new content.
+                    skipped["changed"] += 1
+                    if dead:
+                        held.setdefault(sid, set()).add(p)
+                    continue
+                old = loaded
+                if names_other_session(old, sid):
+                    # The body names a DIFFERENT session, so this file may be
+                    # that session's only copy. scan() never uses such a file
+                    # as a source; it is no target either -- not overwritten
+                    # by this session's winner, not unlinked for this
+                    # session's deletion, and no marker goes next to it.
+                    skipped["destsid"] += 1
+                    if dead:
+                        held.setdefault(sid, set()).add(p)
+                    continue
+                if (old.get("lastActivityAt") is not None
+                        and ms(old.get("lastActivityAt")) <= 0
+                        and os.path.realpath(src) != os.path.realpath(dst)):
+                    # This copy carries a timestamp we cannot read: seconds
+                    # instead of milliseconds, a half-written number, garbage.
+                    # It is therefore not "older than everything", it is
+                    # undatable -- and an undatable destination must not be
+                    # overwritten by an older-but-well-formed copy, nor
+                    # unlinked. Exactly like an unreadable destination: leave
+                    # this store's copy alone and report it.
+                    skipped["destclock"] += 1
+                    if dead:
+                        held.setdefault(sid, set()).add(p)
+                    continue
+
+            if dead:
+                if exists:
+                    ola = ms(old.get("lastActivityAt"))
+                    if ola <= 0:
+                        # No lastActivityAt at all (missing or null), so this
+                        # copy cannot be compared with the marker -- and a
+                        # record with no usable timestamp is never deleted.
+                        # Leave it, and write no marker next to it.
+                        skipped["destclock"] += 1
+                        held.setdefault(sid, set()).add(p)
+                        continue
+                    if ola > mt:
+                        # This copy has been touched since the scan and is now
+                        # newer than the deletion marker, so the marker no
+                        # longer describes it. Leave it and decide next run.
+                        skipped["changed"] += 1
+                        held.setdefault(sid, set()).add(p)
+                        continue
+                    removes.append((dst, best.get("title", "?"), ident, mt))
+                continue
+            # The record stays in this store. Any older deletion marker next to
+            # it is stale (the session was used again after being deleted). The
+            # app never produces that combination itself and it can hide the
+            # session, so clear it -- but only with --propagate-deletions,
+            # which is the only mode that unlinks anything at all.
+            if do_delete and 0 < lt < la:
+                mk = os.path.join(p, "deleted_" + sid[len("local_"):])
+                stale.append((mk, stat_ident(mk)))
+            if os.path.realpath(src) == os.path.realpath(dst):
+                continue
+            if exists and ms(old.get("lastActivityAt")) >= la:
+                continue
+            writes.append((dst, best, src, old, la, exists, ident))
+
+    # A marker nobody could read, for a session no store holds a usable
+    # record for, is still an undecidable item -- and the docs promise every
+    # one of them is reported. The loop above only ever sees sessions that
+    # are in `recs`, so the rest are counted here.
+    for sid in unclear:
+        if sid not in recs:
+            skipped["marker"] += 1
+
+    if do_delete:
+        # Propagate markers -- but only for genuinely dead sessions, and only
+        # into a store where the marker cannot end up next to a record.
+        # Everything in `dels` parsed cleanly, so no '0' marker is ever created.
+        for sid, t in sorted(dels.items()):
+            if sid in unclear:
+                continue
+            rec = recs.get(sid)
+            if rec is not None:
+                la = ms(rec[0].get("lastActivityAt"))
+                if la <= 0 or t < la:
+                    # A stale marker for a still-live session. Never copied.
+                    continue
+            elif sid in on_disk:
+                # No usable record, but a file for this session IS on disk
+                # somewhere -- unparseable, an unusable name, a body naming a
+                # different session, no cliSessionId. A file that could not be
+                # interpreted blocks propagation exactly like `unclear` does:
+                # the alternative is writing a marker next to a living record.
+                skipped["propagate"] += 1
+                continue
+            kept = held.get(sid) or set()
+            for p in paths:
+                if p in kept:
+                    # The record is still in this store: its removal was
+                    # postponed this run, so the marker would hide it here.
+                    skipped["propagate"] += 1
+                    continue
+                if rec is None and os.path.exists(os.path.join(p, sid + ".json")):
+                    # It appeared after the scan.
+                    skipped["propagate"] += 1
+                    continue
+                mk = os.path.join(p, "deleted_" + sid[len("local_"):])
+                if not os.path.lexists(mk):
+                    marks.append((mk, t))
+    return writes, removes, marks, stale, skipped
+
+
+def marker_path_for(record_path):
+    """store/local_<id>.json -> store/deleted_<id>"""
+    d, b = os.path.split(record_path)
+    return os.path.join(d, "deleted_" + b[len("local_"):-len(".json")])
+
+
+def marker_on_disk(record_path):
+    """True when the record's store holds ANY entry under that session's
+    marker name right now -- readable, stale, or not a file at all."""
+    return os.path.lexists(marker_path_for(record_path))
+
+
+# --------------------------------------------------------------------------
+# backups
+# --------------------------------------------------------------------------
+
+def store_key(path):
+    """Backup-relative key for a store path. Round-trips via store_from_key().
+
+        main/<accountUuid>/<orgUuid>
+        profiles/<profile>/<accountUuid>/<orgUuid>
+    """
+    if path.startswith(BASE + os.sep):
+        rel = os.path.relpath(path, BASE).split(os.sep)
+        if len(rel) == 2:
+            return os.path.join("main", rel[0], rel[1])
+    elif path.startswith(PROFILES_ROOT + os.sep):
+        rel = os.path.relpath(path, PROFILES_ROOT).split(os.sep)
+        if len(rel) == 4 and rel[1] == "claude-code-sessions":
+            return os.path.join("profiles", rel[0], rel[2], rel[3])
+    return None
+
+
+def store_from_key(key):
+    """Inverse of store_key(). Returns None for anything unrecognised."""
+    parts = key.split(os.sep)
+    if len(parts) == 3 and parts[0] == "main":
+        return os.path.join(BASE, parts[1], parts[2])
+    if len(parts) == 4 and parts[0] == "profiles":
+        return os.path.join(PROFILES_ROOT, parts[1], "claude-code-sessions",
+                            parts[2], parts[3])
+    return None
+
+
+def backup_time(path):
+    """When a backup was taken, as a unix timestamp.
+
+    Read from the name's own stamp first, so the collision suffix a second run
+    in the same second gets ("...-2") cannot reorder anything: both parse to
+    the same second and the name then breaks the tie in the right direction.
+    Only a name that does not parse falls back to the directory's mtime.
+    """
+    name = os.path.basename(path)[len(BACKUP_PREFIX):]
+    m = re.match(r"^(\d{8}-\d{6})", name)
+    if m:
+        try:
+            return datetime.datetime.strptime(m.group(1), "%Y%m%d-%H%M%S").timestamp()
+        except ValueError:
+            pass
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+def backup_dirs():
+    """Complete backup directories, oldest first. A `.partial` directory is a
+    backup that was interrupted: it is never listed, never restored from and
+    never counted as "this machine has been backed up before"."""
+    out = []
+    for n in scan_names(BACKUP_ROOT):
+        if not n.startswith(BACKUP_PREFIX) or n.endswith(PARTIAL_SUFFIX):
+            continue
+        p = os.path.join(BACKUP_ROOT, n)
+        if os.path.isdir(p):
+            out.append(p)
+    # By time, not lexicographically: the same-second suffix breaks name order
+    # as soon as a freed base name is reused, and the newest backup sorting as
+    # the oldest means the wrong one is pruned and the wrong one suggested by
+    # --restore-list.
+    out.sort(key=lambda p: (backup_time(p), os.path.basename(p)))
+    return out
+
+
+def backup_files(store_path):
+    """The index files of one store -- records and deletion markers only, or
+    None when the store cannot be listed.
+
+    None, never []: "I could not look" must not reach a caller as "there was
+    nothing to copy", or a backup that contains none of a store's records
+    reports itself as complete coverage of it.
+    Only regular files: a symlink is not followed out of the store (and no
+    run ever writes over or unlinks one, so there is nothing to back up), and
+    a fifo is never opened.
+    Conversation transcripts live elsewhere and are never included."""
+    names = list_dir(store_path)
+    if names is None:
+        return None
+    out = []
+    for name in names:
+        if not (is_record_name(name) or name.startswith("deleted_")):
+            continue
+        f = os.path.join(store_path, name)
+        if is_regular_entry(f):
+            out.append(f)
+    return out
+
+
+def is_pre_delete(path):
+    """True for a backup that was taken before a run that deleted something."""
+    return os.path.exists(os.path.join(path, PRE_DELETE_MARK))
+
+
+def prune_backups(protect=None):
+    """Keep the newest KEEP_BACKUPS backups, with two floors on top.
+
+    `protect` is never evicted: a --restore takes a safety backup first, and
+    that must not push out the very backup it is restoring from.
+
+    Nothing younger than MIN_BACKUP_AGE is evicted either, and the NEWEST
+    KEEP_PRE_DELETE pre-deletion backups, plus the very first one, are kept
+    whatever the count says. A count on its own is not retention here: the
+    background job re-plans a destructive run it could not complete every
+    minute, and KEEP_BACKUPS fresh backups in KEEP_BACKUPS minutes would throw
+    away the one copy of the records the first destructive run removed.
+
+    Which end is protected matters. Each pre-deletion backup is the only copy
+    of the state before one destructive run (or one --restore, whose safety
+    backup is marked the same way), and the run someone wants to undo is
+    nearly always a RECENT one: a hidden session is noticed within days.
+    Protecting the oldest three instead evicted the most recent destructive
+    runs first, and with them the safety backup of every --restore. The very
+    first pre-deletion backup is kept as well, because it is the state before
+    this tool deleted anything at all. At most KEEP_PRE_DELETE + 1 backups are
+    therefore unprunable, so that set cannot grow without bound.
+    """
+    keep = os.path.realpath(protect) if protect else None
+    now = time.time()
+    dirs = [d for d in backup_dirs()
+            if not (keep and os.path.realpath(d) == keep)]
+    pre_delete = [d for d in dirs if is_pre_delete(d)]  # oldest first
+    keep_set = set(dirs[-KEEP_BACKUPS:] if KEEP_BACKUPS else dirs)
+    if KEEP_PRE_DELETE:
+        keep_set.update(pre_delete[-KEEP_PRE_DELETE:])
+    keep_set.update(pre_delete[:1])
+    # Only when the directory has run away does the age floor give, and then
+    # oldest first -- see HARD_MAX_BACKUPS. The protected pre-deletion set is
+    # in keep_set, so it is never among them.
+    over_budget = len(dirs) - HARD_MAX_BACKUPS
+    for d in dirs:  # oldest first
+        if d in keep_set:
+            continue
+        if now - backup_time(d) < MIN_BACKUP_AGE:
+            if over_budget <= 0:
+                continue
+            over_budget -= 1
+        try:
+            shutil.rmtree(d)
+        except OSError:
+            pass
+
+
+def backup_fingerprint(paths):
+    """A digest of every index file that a backup of `paths` would contain.
+
+    Name, size and mtime_ns of each file, under its backup-relative key. Two
+    runs get the same digest only when nothing in any store has been touched,
+    which is what makes an existing backup reusable as this run's safety net.
+    None when anything could not be stat'ed or listed -- then nothing may be
+    reused, because a store we cannot enumerate could have changed in any way
+    at all and the digest would not show it.
+    """
+    items = []
+    for p in sorted(paths):
+        key = store_key(p)
+        if key is None:
+            continue
+        files = backup_files(p)
+        if files is None:
+            return None
+        for f in files:
+            try:
+                st = os.stat(f)
+            except OSError:
+                return None
+            items.append("%s/%s|%d|%d"
+                         % (key, os.path.basename(f), st.st_size, st.st_mtime_ns))
+    return hashlib.sha256("\n".join(sorted(items)).encode("utf-8")).hexdigest()
+
+
+def read_small(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read(512).strip()
+    except OSError:
+        return None
+
+
+def backup_covers(bdir, require):
+    """True when `bdir` holds a copy of every file the run may destroy.
+
+    `require` maps a store this run deletes from to the index file names it
+    held during the scan. A name that is no longer on disk is not required --
+    the app may have removed it since -- but anything still there must be in
+    the backup, or this backup is not a safety net for this run.
+
+    An empty `expected` now means what it says: the store was listed and held
+    no index files. A store whose listing FAILED never reaches this function,
+    because sync() drops it from the run before anything is planned for it.
+    """
+    for p, expected in (require or {}).items():
+        if not expected:
+            continue
+        key = store_key(p)
+        if key is None:
+            return False
+        for name in expected:
+            # Same test as backup_files(): only a regular file can be at risk
+            # (nothing ever overwrites or unlinks anything else), so only a
+            # regular file has to be in the backup.
+            if not is_regular_entry(os.path.join(p, name)):
+                continue
+            if not os.path.isfile(os.path.join(bdir, key, name)):
+                return False
+    return True
+
+
+def make_backup(paths, reason, protect=None, require=None, pre_delete=False,
+                fingerprint=None):
+    """Copy every store's index files into a timestamped backup directory.
+
+    Returns the directory, or None if the backup could not be completed. The
+    caller MUST treat None as "there is no safety net" and delete nothing.
+
+    "Completed" means more than "no exception". A store whose path cannot be
+    expressed as a backup key, or whose directory cannot be listed at all,
+    used to be skipped silently while the run went on to delete from it -- an
+    unreadable listing looked exactly like an empty store. So every store in
+    `require` -- the stores this run is about to delete from -- must really
+    have its files in here, a store that could not be enumerated is a failure
+    whenever the run would touch it (there is no way to prove a backup covers
+    a directory you cannot read), and a backup that copied nothing while
+    stores do hold files is a failure too. A hollow directory must never be renamed into
+    place: it would count as "this machine has been backed up before", and it
+    would occupy a retention slot that a real backup needs.
+
+    A single file that cannot be COPIED (mode 000, gone since the listing) is
+    not a failure unless it is one of the files in `require`: it is left out
+    and named in a warning. Failing the whole backup over it meant one
+    unreadable index file anywhere made every backup fail for good -- the
+    first apply then wrote with no backup at all, and every deletion was
+    postponed for ever, also in stores that file had nothing to do with.
+
+    The copy is assembled in <name>.partial and renamed into place only once it
+    is complete, so a backup that fails half way never appears in
+    backup_dirs(), in --restore-list, or as "this machine already has backups".
+    """
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest_root = os.path.join(BACKUP_ROOT, BACKUP_PREFIX + stamp)
+    n = 2
+    while os.path.exists(dest_root):  # two runs within the same second
+        dest_root = os.path.join(BACKUP_ROOT, "%s%s-%d" % (BACKUP_PREFIX, stamp, n))
+        n += 1
+    partial = dest_root + PARTIAL_SUFFIX
+    if fingerprint is None:
+        fingerprint = backup_fingerprint(paths)
+    count = 0
+    copied = {}      # realpath(store) -> names actually copied
+    unmapped = []    # stores holding files that no backup key can describe
+    unlisted = []    # stores whose contents could not even be enumerated
+    uncopied = []    # (file, error) for every file that could not be copied
+    try:
+        os.makedirs(BACKUP_ROOT, exist_ok=True)
+        chmod_quiet(BACKUP_ROOT, DIR_MODE)
+        if os.path.exists(partial):
+            shutil.rmtree(partial)
+        os.makedirs(partial)
+        chmod_quiet(partial, DIR_MODE)
+        for p in paths:
+            key = store_key(p)
+            files = backup_files(p)
+            if files is None:
+                # Cannot be enumerated, so it cannot be copied and cannot be
+                # shown to be covered. sync() drops such a store from the run
+                # long before this point; if one turns up here anyway it is a
+                # failed backup whenever the run would touch it.
+                unlisted.append(p)
+                if p in (require or {}):
+                    raise RuntimeError(
+                        "%s could not be listed, so this backup cannot cover "
+                        "it, and this run would delete from it" % p)
+                continue
+            if key is None:
+                if files:
+                    unmapped.append(p)
+                continue
+            if not files:
+                continue
+            d = os.path.join(partial, key)
+            os.makedirs(d, exist_ok=True)
+            chmod_quiet(d, DIR_MODE)
+            got = copied.setdefault(os.path.realpath(p), set())
+            for f in files:
+                base = os.path.basename(f)
+                try:
+                    shutil.copy2(f, os.path.join(d, base))
+                except OSError as e:
+                    # Left out, not fatal: the coverage check below still
+                    # fails this backup if it is a file the run could
+                    # destroy. A half-written copy must not stay behind, or
+                    # --restore would put it back over the real file.
+                    uncopied.append((f, e))
+                    if os.path.lexists(os.path.join(d, base)):
+                        try:
+                            os.unlink(os.path.join(d, base))
+                        except OSError:
+                            pass
+                    continue
+                chmod_quiet(os.path.join(d, base), FILE_MODE)
+                got.add(base)
+                count += 1
+
+        # Does this cover what the run is about to destroy?
+        for p, expected in (require or {}).items():
+            if not expected:
+                continue
+            got = copied.get(os.path.realpath(p), set())
+            if store_key(p) is None:
+                raise RuntimeError(
+                    "%s cannot be represented in a backup, and this run would "
+                    "delete from it" % p)
+            lost = sorted(name for name in expected
+                          if name not in got
+                          and is_regular_entry(os.path.join(p, name)))
+            if lost:
+                raise RuntimeError(
+                    "%d file(s) in %s could not be backed up (e.g. %s), and "
+                    "this run would delete from it" % (len(lost), p, lost[0]))
+        if count == 0 and (unmapped or uncopied
+                           or any((require or {}).values())):
+            raise RuntimeError("nothing could be copied although the stores "
+                               "hold index files")
+
+        if pre_delete:
+            with open(os.path.join(partial, PRE_DELETE_MARK), "w",
+                      encoding="utf-8") as fh:
+                fh.write(reason + "\n")
+        if fingerprint:
+            with open(os.path.join(partial, FINGERPRINT_FILE), "w",
+                      encoding="utf-8") as fh:
+                fh.write(fingerprint + "\n")
+        os.rename(partial, dest_root)
+        chmod_quiet(dest_root, DIR_MODE)
+    except Exception as e:
+        log("WARNING backup failed: %s" % e, force=True)
+        try:
+            shutil.rmtree(partial)
+        except OSError:
+            pass
+        return None
+    if unmapped:
+        log("WARNING backup does not cover %d store(s) outside the known "
+            "layout: %s" % (len(unmapped), unmapped[0]), force=True)
+    if unlisted:
+        log("WARNING backup does not cover %d store(s) that could not be "
+            "listed: %s" % (len(unlisted), unlisted[0]), force=True)
+    if uncopied:
+        log("WARNING backup left out %d file(s) that could not be copied -- "
+            "none of them is one this run would remove: %s (%s)"
+            % (len(uncopied), uncopied[0][0], uncopied[0][1]), force=True)
+    log("backup: %d file%s -> %s  (%s)"
+        % (count, "" if count == 1 else "s", dest_root, reason), force=True)
+    prune_backups(protect)
+    return dest_root
+
+
+def ensure_backup(paths, reason, require=None, pre_delete=False):
+    """The safety net for this run: an existing identical backup, or a new one.
+
+    A destructive plan the run cannot complete is recomputed every minute by
+    the background job, and taking a fresh full backup each time only churns
+    the retention window. When the newest backup is recent, was taken over a
+    set of index files that still has the same names, sizes and mtimes (see
+    backup_fingerprint; contents are not read), and holds everything this run
+    could destroy, it IS this run's backup -- reuse it.
+    """
+    fp = backup_fingerprint(paths)
+    if fp:
+        dirs = backup_dirs()
+        if dirs:
+            newest = dirs[-1]
+            if (time.time() - backup_time(newest) < BACKUP_REUSE_AGE
+                    and read_small(os.path.join(newest, FINGERPRINT_FILE)) == fp
+                    and backup_covers(newest, require)):
+                if pre_delete and not is_pre_delete(newest):
+                    try:
+                        with open(os.path.join(newest, PRE_DELETE_MARK), "w",
+                                  encoding="utf-8") as fh:
+                            fh.write(reason + "\n")
+                    except OSError as e:
+                        # It cannot be protected from pruning, so do not rely
+                        # on it; take a real one instead.
+                        log("WARNING could not mark %s as pre-deletion: %s"
+                            % (newest, e), force=True)
+                        return make_backup(paths, reason, require=require,
+                                           pre_delete=pre_delete, fingerprint=fp)
+                log("backup: reusing %s -- no index file has changed since it "
+                    "was written  (%s)" % (newest, reason), force=True)
+                return newest
+    return make_backup(paths, reason, require=require, pre_delete=pre_delete,
+                       fingerprint=fp)
+
+
+def restore_list():
+    dirs = backup_dirs()
+    if not dirs:
+        print("no backups yet in %s" % BACKUP_ROOT)
+        print("a backup is taken automatically before the first apply and "
+              "before any run that deletes something.")
+        return 0
+    print("backups in %s (newest last):" % BACKUP_ROOT)
+    for d in dirs:
+        stamp = os.path.basename(d)[len(BACKUP_PREFIX):]
+        recs = markers = nstores = 0
+        for root, _dirs, files in os.walk(d):
+            here = [f for f in files
+                    if f.startswith("local_") or f.startswith("deleted_")]
+            if here:
+                nstores += 1
+            recs += len([f for f in here if f.startswith("local_")])
+            markers += len([f for f in here if f.startswith("deleted_")])
+        print("   %-20s  %3d record%s  %3d marker%s  %d store%s"
+              % (stamp, recs, " " if recs == 1 else "s",
+                 markers, " " if markers == 1 else "s",
+                 nstores, "" if nstores == 1 else "s"))
+    print("\nrestore with: --restore %s"
+          % os.path.basename(dirs[-1])[len(BACKUP_PREFIX):])
+    return 0
+
+
+def restore(stamp):
+    """Copy a backup's files back into the matching stores.
+
+    Nothing is removed except the deletion markers of the very sessions being
+    restored. Those markers are what removed the records in the first place, so
+    leaving them in place would make the next sync undo the restore within a
+    minute. Every other file, in every store, is left exactly as it is.
+
+    The current state is backed up first -- every existing store the restore
+    writes into or clears a marker in, including a profile store the sync
+    itself currently skips as frozen -- so a restore can itself be rolled back
+    with another --restore. If that safety backup cannot be written, or lacks
+    a file the restore would copy over or a marker it would clear, the restore
+    does not start at all. A store that cannot be listed cannot be backed up,
+    so nothing is written into it and no marker in it is cleared. A backup
+    key for a profile that no longer exists (`claude-multi remove`) is
+    skipped rather than recreated as a bare directory tree.
+    """
+    stamp = str(stamp).strip()
+    name = stamp if stamp.startswith(BACKUP_PREFIX) else BACKUP_PREFIX + stamp
+    if name.endswith(PARTIAL_SUFFIX):
+        print("that is an interrupted backup, not a complete one: %s" % name)
+        return 1
+    src_root = os.path.join(BACKUP_ROOT, name)
+    if not os.path.isdir(src_root):
+        print("no such backup: %s" % src_root)
+        print("run --restore-list to see what is available.")
+        return 1
+
+    # Pass 1: read the backup. Group the files by destination store and collect
+    # the session ids it holds a record for.
+    todo, revive, skipped = [], set(), 0
+    for root, _dirs, files in os.walk(src_root):
+        files = sorted(f for f in files
+                       if f.startswith("local_") or f.startswith("deleted_"))
+        if not files:
+            continue
+        key = os.path.relpath(root, src_root)
+        dest = store_from_key(key)
+        if dest is None:
+            print("   skipped (unrecognised path in backup): %s" % key)
+            skipped += len(files)
+            continue
+        if (dest.startswith(PROFILES_ROOT + os.sep) and not os.path.isdir(
+                os.path.join(PROFILES_ROOT, key.split(os.sep)[1]))):
+            # The profile was removed. Writing into it would recreate a bare
+            # directory tree the sync then skips (no config.json), and its
+            # sessions are not revived from here, so no marker elsewhere is
+            # cleared on their account either.
+            print("   skipped (that profile no longer exists): %s" % key)
+            skipped += len(files)
+            continue
+        todo.append((dest, root, files))
+        for f in files:
+            if f.startswith("local_") and f.endswith(".json"):
+                revive.add(f[:-len(".json")])
+    if not todo:
+        print("nothing in this backup matches a store on this machine:")
+        print("   %s" % src_root)
+        return 1
+
+    # A store whose directory cannot be listed cannot be copied into the
+    # safety backup, so a restore into it could not be undone -- and a restore
+    # overwrites records and clears markers. Leave it completely alone, the
+    # same way a sync run drops it.
+    live_stores, blind = [], []
+    for p in stores():
+        (blind if list_dir(p) is None else live_stores).append(p)
+    # The safety backup has to cover every store this restore can write into
+    # or clear a marker in -- not only the ones the sync syncs today. A backup
+    # key can name a profile store the sync now treats as frozen (idle and
+    # unregistered, say), and the restore writes into that one as well. One
+    # that cannot be listed cannot be backed up, so it is left alone too.
+    touched = list(live_stores)
+    for d, _r, _f in todo:
+        if d in touched or d in blind or not os.path.isdir(d):
+            continue
+        (blind if list_dir(d) is None else touched).append(d)
+    blind_real = set(os.path.realpath(p) for p in blind)
+    for p in blind:
+        print("   skipped (cannot be listed, so it cannot be backed up): %s" % p)
+
+    # A restore is a rollback: every backed-up record is copied over the
+    # current one without comparing timestamps. That is what it is for, and
+    # the safety backup below makes it reversible -- but a record that is
+    # NEWER on disk than in the backup goes back in time, and the user has to
+    # be told that, with numbers, before anything is touched.
+    replaced, rollback = 0, []
+    for dest, root, files in todo:
+        if os.path.realpath(dest) in blind_real:
+            continue
+        for f in files:
+            if not (f.startswith("local_") and f.endswith(".json")):
+                continue
+            cur_path = os.path.join(dest, f)
+            if not is_regular_entry(cur_path):
+                continue
+            replaced += 1
+            cur = load_record(cur_path)
+            old = load_record(os.path.join(root, f))
+            if cur is None or old is None:
+                continue
+            if ms(cur.get("lastActivityAt")) > ms(old.get("lastActivityAt")):
+                rollback.append((str(cur.get("title", "?")), label(dest)))
+    if replaced:
+        n = len(rollback)
+        print("this restore replaces %d record%s that exist%s now; %s"
+              % (replaced, "" if replaced == 1 else "s",
+                 "s" if replaced == 1 else "",
+                 ("it is not newer on disk than in the backup." if replaced == 1
+                  else "none of them is newer on disk than in the backup.")
+                 if not n else
+                 "%d of them %s newer on disk than in the backup and %s rolled "
+                 "back to the backup's older copy:"
+                 % (n, "is" if n == 1 else "are", "is" if n == 1 else "are")))
+        for title, where in rollback[:5]:
+            print("   ROLLBACK  %-46s  %s" % (title[:44], where))
+        if n > 5:
+            print("   ... and %d more" % (n - 5))
+        if n:
+            print("   (a store this backup does not cover that holds the newer "
+                  "copy hands it back\n    on the next sync -- newest wins.)")
+        print("the current state is backed up first, so this restore can itself "
+              "be undone with\nanother --restore.\n")
+
+    # A restore overwrites current records, so make it undoable -- and refuse
+    # to run if it cannot be. `protect` keeps this backup from being pruned by
+    # the safety backup that is about to be taken.
+    # pre_delete: this one holds the only copy of the state the restore is
+    # about to overwrite, and it clears markers too, so retention must protect
+    # it the same way it protects a backup taken before a deletion.
+    # `require`: every file the restore can destroy -- each existing file it
+    # copies over, each marker it clears -- must really be in that backup,
+    # or the restore does not start.
+    clears = set("deleted_" + s[len("local_"):] for s in revive)
+    require = {}
+    for d in touched:
+        here = set(list_dir(d) or [])
+        at_risk = here & clears
+        for dest, _root, files in todo:
+            if dest == d:
+                at_risk.update(here.intersection(files))
+        require[d] = at_risk
+    if make_backup(touched, "before --restore " + name[len(BACKUP_PREFIX):],
+                   protect=src_root, require=require, pre_delete=True) is None:
+        print("ERROR the current state could not be backed up, so nothing was "
+              "restored.")
+        print("free some space or fix the permissions on %s, then try again."
+              % BACKUP_ROOT)
+        return 1
+
+    restored = 0
+    beside_live, not_file = [], []
+    for dest, root, files in todo:
+        if (os.path.realpath(dest) in blind_real
+                or (os.path.isdir(dest) and list_dir(dest) is None)):
+            print("   ERROR %s cannot be listed, so it is not in the safety "
+                  "backup; nothing was restored into it" % dest)
+            continue
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as e:
+            print("   ERROR could not create %s: %s" % (dest, e))
+            continue
+        wrote = 0
+        for f in files:
+            target = os.path.join(dest, f)
+            if f.startswith("deleted_"):
+                sid = "local_" + f[len("deleted_"):]
+                if sid in revive:
+                    # This marker is what deleted a record the backup is
+                    # bringing back. Writing it again would cancel the restore.
+                    continue
+                if os.path.lexists(os.path.join(dest, sid + ".json")):
+                    # The store holds a live record for that session NOW (it
+                    # was used again after the backup was taken). A marker
+                    # next to it is the pair that hides a session -- a state
+                    # the backup never contained -- so it is left out.
+                    beside_live.append(target)
+                    continue
+            try:
+                st = os.lstat(target)
+            except FileNotFoundError:
+                st = None
+            except OSError as e:
+                print("   ERROR restoring %s: %s" % (f, e))
+                continue
+            if st is not None and not stat_mod.S_ISREG(st.st_mode):
+                # A directory, a symlink or a fifo under an index file's name.
+                # copy2 would write INTO it or THROUGH it; never do either.
+                not_file.append(target)
+                continue
+            try:
+                shutil.copy2(os.path.join(root, f), target)
+                wrote += 1
+            except Exception as e:
+                print("   ERROR restoring %s: %s" % (f, e))
+        restored += wrote
+        print("   %-24s <- %d file%s" % (label(dest), wrote,
+                                         "" if wrote == 1 else "s"))
+
+    # Clear the markers for the restored sessions in EVERY store, not only the
+    # ones this backup covers: the deletion timestamp used by the sync is the
+    # maximum across all stores, so a single surviving marker anywhere would
+    # delete the session again on the next run.
+    targets = set(live_stores)
+    targets.update(d for d, _r, _f in todo
+                   if os.path.realpath(d) not in blind_real)
+    cleared = []
+    for store in sorted(targets):
+        for sid in sorted(revive):
+            mk = os.path.join(store, "deleted_" + sid[len("local_"):])
+            if not os.path.lexists(mk):
+                continue
+            if not is_regular_entry(mk):
+                # Not a marker file: a directory, a symlink, a fifo. Only a
+                # marker is cleared. The sync leaves that session alone while
+                # the entry is there, which is reported below.
+                not_file.append(mk)
+                continue
+            try:
+                os.unlink(mk)
+                cleared.append(mk)
+            except OSError as e:
+                print("   ERROR could not clear %s: %s" % (mk, e))
+
+    print("\nrestored %d file%s from %s"
+          % (restored, "" if restored == 1 else "s", src_root))
+    if cleared:
+        print("cleared %d deletion marker%s belonging to the restored sessions "
+              "(otherwise the\nnext sync would delete them again):"
+              % (len(cleared), "" if len(cleared) == 1 else "s"))
+        for mk in cleared[:5]:
+            print("   %s" % mk)
+        if len(cleared) > 5:
+            print("   ... and %d more" % (len(cleared) - 5))
+    if beside_live:
+        print("left out %d deletion marker%s from the backup: that store now "
+              "holds a live record\nfor the session, and a marker next to it "
+              "would hide it:"
+              % (len(beside_live), "" if len(beside_live) == 1 else "s"))
+        for mk in beside_live[:5]:
+            print("   %s" % mk)
+        if len(beside_live) > 5:
+            print("   ... and %d more" % (len(beside_live) - 5))
+    if not_file:
+        print("left alone %d entr%s that %s not a regular file (a directory, a "
+              "symlink, a fifo)\nunder an index file's name. Nothing was "
+              "written into or through %s, and the sync\nwill not touch %s "
+              "either -- remove %s by hand:"
+              % (len(not_file), "y" if len(not_file) == 1 else "ies",
+                 "is" if len(not_file) == 1 else "are",
+                 "it" if len(not_file) == 1 else "them",
+                 "it" if len(not_file) == 1 else "them",
+                 "it" if len(not_file) == 1 else "them"))
+        for p in not_file[:5]:
+            print("   %s" % p)
+        if len(not_file) > 5:
+            print("   ... and %d more" % (len(not_file) - 5))
+    if skipped:
+        print("skipped %d file%s in unrecognised locations or removed profiles"
+              % (skipped, "" if skipped == 1 else "s"))
+    print("nothing else was removed; anything this backup does not know about "
+          "was left alone.")
+    print("\nrestart Claude Desktop (or switch accounts) to see the restored list.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# applying
+# --------------------------------------------------------------------------
+
+def sweep_stray_temps(paths):
+    """Delete leftover temp files from a run that was killed between open() and
+    os.replace(). They are this tool's own scratch files -- never a record and
+    never a marker -- so this runs in the default mode too, which removes
+    nothing else at all.
+
+    Only the exact name the writer produces is swept (TMP_RE). An earlier
+    version also swept any `local_*.tmp`, i.e. files this tool never wrote;
+    whatever else sits in a store is not ours to remove."""
+    now = time.time()
+    n = 0
+    for p in paths:
+        for name in scan_names(p):
+            if not TMP_RE.match(name):
+                continue
+            f = os.path.join(p, name)
+            try:
+                if not is_regular_entry(f):
+                    continue
+                if now - os.path.getmtime(f) < STRAY_TMP_AGE:
+                    continue
+                os.unlink(f)
+                n += 1
+            except OSError:
+                continue
+    if n:
+        log("cleaned %d stray temp file%s left behind by an interrupted run"
+            % (n, "" if n == 1 else "s"), force=True)
+
+
+def skipped_note(skipped):
+    """Human wording for the items plan() deliberately left alone."""
+    parts = []
+    if skipped.get("marker"):
+        parts.append("%d session(s) with an unreadable deletion marker"
+                     % skipped["marker"])
+    if skipped.get("markertype"):
+        n = skipped["markertype"]
+        parts.append("%d deletion-marker entr%s that %s not a regular file (a "
+                     "directory, a symlink, a fifo): unknown-but-present, so "
+                     "that session is left alone in every store until the "
+                     "entry is removed by hand"
+                     % (n, "y" if n == 1 else "ies", "is" if n == 1 else "are"))
+    if skipped.get("pair"):
+        parts.append("%d record write(s) not made because the destination "
+                     "store holds a deletion marker for that session (a record "
+                     "next to a marker can hide it)" % skipped["pair"])
+    if skipped.get("timestamp"):
+        parts.append("%d session(s) with no usable lastActivityAt next to a marker"
+                     % skipped["timestamp"])
+    if skipped.get("dest"):
+        parts.append("%d store copy(s) that could not be read" % skipped["dest"])
+    if skipped.get("destclock"):
+        parts.append("%d store copy(s) whose own lastActivityAt is not a "
+                     "plausible millisecond timestamp (or, next to a deletion, "
+                     "is missing), so they were neither overwritten nor removed"
+                     % skipped["destclock"])
+    if skipped.get("destsid"):
+        parts.append("%d store copy(s) whose sessionId names a different "
+                     "session than the file name, so they were neither "
+                     "overwritten nor removed" % skipped["destsid"])
+    if skipped.get("changed"):
+        parts.append("%d store copy(s) that changed while the run was deciding"
+                     % skipped["changed"])
+    if skipped.get("sid"):
+        parts.append("%d record file(s) whose sessionId contradicts the file "
+                     "name" % skipped["sid"])
+    if skipped.get("name"):
+        parts.append("%d record file(s) with an unusable file name"
+                     % skipped["name"])
+    if skipped.get("clock"):
+        parts.append("%d record copy(s) whose lastActivityAt is not a "
+                     "plausible millisecond timestamp" % skipped["clock"])
+    if skipped.get("unreadable"):
+        parts.append("%d record file(s) that could not be read this run"
+                     % skipped["unreadable"])
+    if skipped.get("nocli"):
+        parts.append("%d record file(s) with no cliSessionId (nothing for "
+                     "another account to resume)" % skipped["nocli"])
+    if skipped.get("propagate"):
+        parts.append("%d deletion marker(s) not propagated because a file for "
+                     "that session is still on disk" % skipped["propagate"])
+    if skipped.get("store"):
+        parts.append("%d store(s) dropped from the run: the directory could "
+                     "not be listed" % skipped["store"])
+    return parts
+
+
+def sync(apply_, do_delete):
+    paths = stores()
+    if len(paths) < 2:
+        if not apply_:
+            print("found %d session store%s, so there is nothing to sync yet:"
+                  % (len(paths), "" if len(paths) == 1 else "s"))
+            for p in paths:
+                print("   %s" % p)
+            print("\nA profile that has never been signed in has no store yet. "
+                  "Sign in to\nthe second account (see `claude-multi setup`) and "
+                  "run this again.")
+            return 0
+        log("nothing to sync: fewer than two stores found")
+        return 0
+    recs, dels, local_dels, unclear, seen, sskip, bad = scan(paths)
+    if bad:
+        # A store that could not be LISTED is not an empty store. It is
+        # dropped from the run completely -- not read, not planned for, not
+        # written to, not deleted from -- because os.path.exists() and open()
+        # would keep working on it while a backup could only copy what it can
+        # enumerate, i.e. none of it.
+        for p in bad:
+            log("WARNING %s could not be listed, so the whole store is "
+                "dropped from this run: nothing is read from it, written to "
+                "it or removed from it, and its deletion markers are ignored"
+                % p, force=True)
+        dropped = set(bad)
+        paths = [p for p in paths if p not in dropped]
+        if len(paths) < 2:
+            msg = ("fewer than two readable stores left after dropping %d "
+                   "unreadable one(s) -- nothing to sync" % len(bad))
+            if apply_:
+                log(msg, force=True)
+            else:
+                print(msg)
+            return 0
+    writes, removes, marks, stale, skipped = plan(
+        paths, recs, dels, local_dels, unclear, seen, do_delete)
+    for k, v in sskip.items():
+        skipped[k] = skipped.get(k, 0) + v
+    if bad:
+        skipped["store"] = skipped.get("store", 0) + len(bad)
+    # What this run could destroy, store by store: the records it would unlink
+    # and the stale markers it would clear, by name. A backup that does not
+    # contain those is not a safety net for this run. Any OTHER file the
+    # backup cannot copy is left out with a warning (see make_backup): one
+    # unreadable file must not postpone every deletion in every store.
+    require = {}
+    for dst, _title, _ident, _mt in removes:
+        require.setdefault(os.path.dirname(dst), set()).add(os.path.basename(dst))
+    for mk, _ident in stale:
+        require.setdefault(os.path.dirname(mk), set()).add(os.path.basename(mk))
+    for mk, _t in marks:
+        # Writing a marker hides the session in that store just as surely as
+        # unlinking the record does, and --restore undoes it by clearing the
+        # marker again -- so that store has to be in the backup. Nothing on
+        # disk there is overwritten (a marker is only ever created, next to no
+        # record), so no file in it is required.
+        require.setdefault(os.path.dirname(mk), set())
+    act = active_store()
+    act_real = os.path.realpath(act) if act else None
+    destructive = bool(removes or marks or stale)
+    first_apply = not backup_dirs()
+
+    if not apply_:
+        print("deletion propagation: %s"
+              % ("ON (--propagate-deletions): a session whose marker is at "
+                 "least as new as\n                      the winning record "
+                 "is removed from every store and the marker\n"
+                 "                      is copied there"
+                 if do_delete else
+                 "OFF (the default): no record or marker is ever unlinked.\n"
+                 "                      Records are only added, or replaced "
+                 "by a strictly newer copy;\n"
+                 "                      a store that holds a marker for a "
+                 "session is left alone.\n"
+                 "                      Pass --propagate-deletions to apply "
+                 "deletions as well."))
+        print("stores (%d):" % len(paths))
+        for p in paths:
+            flag = ""
+            if act_real and os.path.realpath(p) == act_real:
+                flag = "  <- the store the app is using now"
+            print("   %3d  %-22s%s" % (record_count(p), label(p), flag))
+        print("\nunique sessions       : %d" % len(recs))
+        print("records to write      : %d" % len(writes))
+        for dst, best, src, old, la, exists, ident in sorted(
+                writes, key=lambda x: -x[4])[:15]:
+            print("   %s  %-46s -> %s"
+                  % ("update" if exists else "NEW   ",
+                     str(best.get("title", "?"))[:44], label(os.path.dirname(dst))))
+        suffix = "" if do_delete else "   (deletion propagation is off)"
+        print("records to remove (deleted)  : %d%s" % (len(removes), suffix))
+        for dst, title, _ident, _mt in removes[:10]:
+            print("   DELETE  %-46s -> %s" % (str(title)[:44], label(os.path.dirname(dst))))
+        print("deletion markers to propagate: %d%s" % (len(marks), suffix))
+        print("stale markers to clear       : %d%s" % (len(stale), suffix))
+        notes = skipped_note(skipped)
+        if notes:
+            print("\nleft untouched this run (something could not be read):")
+            for n in notes:
+                print("   %s" % n)
+            print("   nothing is deleted or copied on a guess; a later run "
+                  "decides once the\n   file is complete.")
+        if (writes or destructive) and (destructive or first_apply):
+            print("\na backup would be written to %s/%s<timestamp>/"
+                  % (BACKUP_ROOT, BACKUP_PREFIX))
+        print("\nrun with --apply to make these changes.")
+        print("note: the lines above contain your own session titles and "
+              "profile names --\nredact them before pasting this into a bug "
+              "report.")
+        return 0
+
+    sweep_stray_temps(paths)
+
+    if (writes or destructive) and (destructive or first_apply):
+        reason = ("before deleting records" if destructive
+                  else "first apply on this machine")
+        if ensure_backup(paths, reason, require=require,
+                         pre_delete=destructive) is None:
+            # No safety net. Nothing may be deleted: not a record, not a
+            # marker, not a stale marker. Writes still go ahead -- they only
+            # ever replace a record with a strictly newer copy that remains on
+            # disk in the store it came from, so they are recoverable without
+            # a backup; a deletion is not. (That holds because plan() refuses
+            # to overwrite a destination it could not read, could not date, or
+            # whose body names another session: "strictly newer" is a
+            # comparison between two timestamps we actually understood, about
+            # one session, never a default win over an unreadable one.)
+            if destructive:
+                # The stale markers stay where they are this run, so every
+                # write planned into a store that still holds a marker for
+                # that session has to stay out as well: written, it would
+                # leave record and marker side by side -- the pair that can
+                # hide the session, created by this tool, and one no later
+                # default run could repair. The same rule the default mode
+                # applies in plan().
+                held_back = [w for w in writes if marker_on_disk(w[0])]
+                writes = [w for w in writes if not marker_on_disk(w[0])]
+                skipped["pair"] = skipped.get("pair", 0) + len(held_back)
+                log("ERROR backup failed, so nothing is deleted this run: "
+                    "%d removal(s), %d marker(s) and %d stale marker(s) "
+                    "postponed until a backup can be written%s"
+                    % (len(removes), len(marks), len(stale),
+                       ", and with them %d record write(s) into a store that "
+                       "still holds a marker for that session"
+                       % len(held_back) if held_back else ""), force=True)
+            removes, marks, stale = [], [], []
+            destructive = False
+
+    wrote = removed = marked = cleared = 0
+    # Everything below re-checks its target immediately before touching it.
+    # The plan was made before the sweep and the backup, which on a large store
+    # is seconds to minutes ago, and the app writes to the store it has open
+    # continuously -- so "the file I decided about" and "the file that is there
+    # now" have to be shown to be the same file.
+    #
+    # ORDER: stale markers are cleared BEFORE any record is written. Written
+    # the other way round, a run killed between the two loops -- or a stale
+    # marker whose clearing is refused below -- leaves record and marker side
+    # by side. This way the worst a crash can leave is a store with neither,
+    # which the next run simply fills. (`stale` is always empty in the default
+    # mode, which never unlinks a marker.)
+    for mk, ident in stale:
+        now_ident = stat_ident(mk)
+        if now_ident is None:
+            continue
+        if now_ident != ident:
+            # The marker was rewritten after the plan: it may now be newer
+            # than the record, in which case clearing it would resurrect a
+            # session the user just deleted.
+            skipped["changed"] += 1
+            continue
+        try:
+            os.unlink(mk)
+            cleared += 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log("ERROR could not clear %s: %s" % (mk, e), force=True)
+    for dst, best, src, old, la, exists, ident in writes:
+        if stat_ident(dst) != ident:
+            # It was created, replaced or removed since the plan. The
+            # comparison that chose this winner no longer describes it, and
+            # os.replace() would silently discard whatever is there now.
+            skipped["changed"] += 1
+            continue
+        if marker_on_disk(dst):
+            # A marker for this session is in this store RIGHT NOW: a stale
+            # one whose clearing above was refused or failed, or one the app
+            # wrote after the plan (the session was deleted here meanwhile).
+            # Never write a record next to it, in either mode.
+            skipped["pair"] = skipped.get("pair", 0) + 1
+            continue
+        if exists:
+            # The identity says "same file", not "same bytes". Read it once
+            # more: it must still be a record of THIS session, and still
+            # strictly older than the copy about to replace it.
+            cur = load_record(dst)
+            if (cur is None
+                    or names_other_session(cur, os.path.basename(dst)[:-len(".json")])
+                    or ms(cur.get("lastActivityAt")) >= la
+                    or (cur.get("lastActivityAt") is not None
+                        and ms(cur.get("lastActivityAt")) <= 0)
+                    or stat_ident(dst) != ident):
+                skipped["changed"] += 1
+                continue
+        rec = dict(best)
+        # bridgeSessionIds is Remote Control identity and belongs to the source
+        # account's cloud. Drop it; keep the target's own value if it has one.
+        rec.pop("bridgeSessionIds", None)
+        if isinstance(old, dict) and old.get("bridgeSessionIds"):
+            rec["bridgeSessionIds"] = old["bridgeSessionIds"]
+        # Unique, hidden, and not ending in .json: two overlapping runs cannot
+        # share it, and an orphan cannot be mistaken for a record by the app.
+        tmp = os.path.join(os.path.dirname(dst), "%s%d-%s%s"
+                           % (TMP_PREFIX, os.getpid(), os.path.basename(dst),
+                              TMP_SUFFIX))
+        try:
+            # UTF-8 whatever the locale: under a Latin-1 locale the default
+            # encoding wrote bytes nothing can read back as JSON.
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                shutil.copystat(src, tmp)
+            except OSError:
+                pass  # cosmetic only; never lose the write over it
+            # Last look, with the temp file complete: writing, fsync and
+            # copystat take milliseconds, and the app may have written a newer
+            # copy, or deleted the session here, in the meantime. This does
+            # not close the window -- nothing short of the app's cooperation
+            # can -- but it shrinks it to these two calls and the rename.
+            now_ident = stat_ident(dst)
+            if now_ident != ident or marker_on_disk(dst):
+                k = "changed" if now_ident != ident else "pair"
+                skipped[k] = skipped.get(k, 0) + 1
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                continue
+            os.replace(tmp, dst)
+            wrote += 1
+        except Exception as e:
+            log("ERROR could not write %s: %s" % (dst, e), force=True)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    for dst, title, ident, mt in removes:
+        now_ident = stat_ident(dst)
+        if now_ident is None:
+            continue  # already gone; nothing to do and nothing to report
+        if now_ident != ident:
+            # Rewritten since the plan. If the app touched it, the session was
+            # resumed after the deletion and must survive; decide next run.
+            skipped["changed"] += 1
+            continue
+        cur = load_record(dst)
+        if cur is None:
+            skipped["dest"] += 1
+            continue
+        cla = ms(cur.get("lastActivityAt"))
+        if (cla <= 0 or cla > mt
+                or names_other_session(cur, os.path.basename(dst)[:-len(".json")])):
+            # Newer than the marker, undatable, or now naming a different
+            # session: not what the plan decided to remove. Leave it.
+            skipped["changed"] += 1
+            continue
+        try:
+            os.unlink(dst)
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log("ERROR could not remove %s: %s" % (dst, e), force=True)
+    for mk, t in marks:
+        rec_path = os.path.join(os.path.dirname(mk),
+                                "local_" + os.path.basename(mk)[len("deleted_"):]
+                                + ".json")
+        if os.path.lexists(rec_path):
+            # A record for this session is in this store RIGHT NOW: its
+            # removal above was postponed or failed, or the app re-created it
+            # while this run was working. A marker next to a record is the
+            # pair that hides a session, and no later run clears it, so the
+            # marker is simply not written. Re-checked here and not only in
+            # plan(), because the removals happened in between.
+            skipped["propagate"] += 1
+            continue
+        # O_EXCL: `marks` only holds markers that did not exist at plan time.
+        # If one exists now it is the store's own, with its own timestamp, and
+        # overwriting it would replace the app's decision with ours.
+        try:
+            fd = os.open(mk, os.O_WRONLY | os.O_CREAT | os.O_EXCL, FILE_MODE)
+        except FileExistsError:
+            skipped["changed"] += 1
+            continue
+        except OSError as e:
+            log("ERROR could not write %s: %s" % (mk, e), force=True)
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(str(t))
+            marked += 1
+        except Exception as e:
+            log("ERROR could not write %s: %s" % (mk, e), force=True)
+
+    # `marked` counts too: a run whose only effect is propagating deletion
+    # markers changed the stores and must not be silent. What counts is what
+    # actually HAPPENED: a write that is planned but refused every time (a
+    # marker whose name differs from the record's only in letter case, which
+    # APFS still finds) must not make the background job log a
+    # "synced: 0 record(s) written" line every minute. An interactive run
+    # still reports what it planned.
+    if wrote or removed or marked or cleared or (
+            not QUIET and (writes or removes or marks or stale)):
+        extra = "" if do_delete else "  [deletion propagation off (default)]"
+        if cleared:
+            extra += "  [%d stale marker(s) cleared]" % cleared
+        notes = skipped_note(skipped)
+        if notes:
+            extra += "  [left untouched: %s]" % "; ".join(notes)
+        # These are the counts that actually succeeded, not the planned ones.
+        log("synced: %d record(s) written, %d deleted record(s) removed, "
+            "%d marker(s) propagated (%d session(s) / %d store(s))%s"
+            % (wrote, removed, marked, len(recs), len(paths), extra),
+            force=True)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# background job
+# --------------------------------------------------------------------------
+
+def python_for_launchd():
+    """The interpreter to bake into the plist.
+
+    launchd keeps running this for months, so the path has to be one that will
+    still be there. Prefer the system python3: this script is stdlib-only, and
+    /usr/bin/python3 outlives virtualenvs, Homebrew upgrades and Xcode being
+    moved or removed -- sys.executable is often something like
+    /Applications/Xcode.app/.../python3, which would break the job the moment
+    Xcode changes. Fall back to the running interpreter only when the system
+    one cannot actually run (Command Line Tools not installed).
+    """
+    system = "/usr/bin/python3"
+    if os.path.exists(system):
+        try:
+            r = subprocess.run([system, "-c", "import sys"],
+                               capture_output=True, timeout=20)
+            if r.returncode == 0:
+                return system
+        except Exception:
+            pass
+    exe = sys.executable
+    if exe and os.path.isabs(exe) and os.path.exists(exe):
+        print("note: %s is not usable, the job will run %s instead." % (system, exe))
+        return exe
+    return system
+
+
+def install(interval, do_delete):
+    if interval < MIN_INTERVAL:
+        print("warning: %ds is too short, launchd throttles below %ds. Using %ds."
+              % (interval, MIN_INTERVAL, MIN_INTERVAL))
+        interval = MIN_INTERVAL
+    args = [python_for_launchd(), SCRIPT, "--apply", "--quiet"]
+    if do_delete:
+        args.append("--propagate-deletions")
+    data = {
+        "Label": LABEL,
+        "ProgramArguments": args,
+        "StartInterval": interval,
+        # Also fire on account switch: the app rewrites config.json then.
+        "WatchPaths": [os.path.join(APP, "config.json")],
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        # A file of its own: launchd holds this open and appends to it, so it
+        # must not be the log this script rewrites when it trims.
+        "StandardErrorPath": ERRLOG,
+    }
+    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+    os.makedirs(LOGDIR, exist_ok=True)
+    chmod_quiet(LOGDIR, DIR_MODE)
+    with open(PLIST, "wb") as fh:
+        plistlib.dump(data, fh)
+    uid = str(os.getuid())
+    subprocess.run(["launchctl", "bootout", "gui/%s/%s" % (uid, LABEL)],
+                   capture_output=True)
+    r = subprocess.run(["launchctl", "bootstrap", "gui/%s" % uid, PLIST],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print("launchctl bootstrap failed:", r.stderr.strip())
+        return 1
+    print("installed: %s" % PLIST)
+    print("interval : every %s (and on every account switch)" % human(interval))
+    print("deletion : %s" % ("propagated (--propagate-deletions)" if do_delete
+                             else "NOT propagated (the default)"))
+    print("log      : %s" % LOG)
+    print("errors   : %s" % ERRLOG)
+    return 0
+
+
+def uninstall():
+    uid = str(os.getuid())
+    subprocess.run(["launchctl", "bootout", "gui/%s/%s" % (uid, LABEL)],
+                   capture_output=True)
+    if os.path.exists(PLIST):
+        os.unlink(PLIST)
+    print("removed.")
+    return 0
+
+
+def status():
+    if os.path.exists(PLIST):
+        try:
+            with open(PLIST, "rb") as fh:
+                d = plistlib.load(fh)
+            iv = d.get("StartInterval", 0)
+            # --no-delete may still be in a plist installed by an older
+            # version. It is a no-op now, and not propagating is the default,
+            # so only the opt-in flag is worth looking for.
+            prop = "--propagate-deletions" in (d.get("ProgramArguments") or [])
+            print("interval : every %s" % human(iv))
+            print("deletion : %s" % ("propagated (--propagate-deletions)" if prop
+                                     else "NOT propagated (the default)"))
+        except Exception as e:
+            print("could not read plist:", e)
+    else:
+        print("background job is not installed. install it with: "
+              "--install [--every 1m] [--propagate-deletions]")
+    uid = str(os.getuid())
+    r = subprocess.run(["launchctl", "print", "gui/%s/%s" % (uid, LABEL)],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            if re.search(r"\b(runs|last exit code) ", line):
+                print("  ", line.strip())
+    dirs = backup_dirs()
+    if dirs:
+        print("backups  : %d kept, newest %s" % (len(dirs), os.path.basename(dirs[-1])))
+    try:
+        errsize = os.path.getsize(ERRLOG)
+    except OSError:
+        errsize = 0
+    if errsize:
+        print("errors   : %s (%d bytes -- the job wrote to stderr)"
+              % (ERRLOG, errsize))
+    if os.path.exists(LOG):
+        print("\nrecent log lines (%s):" % LOG)
+        try:
+            with open(LOG, encoding="utf-8", errors="replace") as fh:
+                for line in fh.readlines()[-8:]:
+                    print("  ", line.rstrip())
+        except OSError as e:
+            print("   could not read the log:", e)
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+EPILOG = """\
+what is synced:  only the small per-account session index files
+                 (~/Library/Application Support/Claude/claude-code-sessions/
+                  <accountUuid>/<orgUuid>/local_<id>.json)
+never touched:   conversation transcripts in ~/.claude/projects/ -- they are
+                 not account-scoped and every account already shares them
+deletion mode:   OPT-IN, and OFF unless you pass --propagate-deletions.
+                 The default run never unlinks a record, never writes or
+                 copies a deletion marker and never clears a stale one: it
+                 only adds a record to a store that lacks it, or replaces a
+                 strictly older copy. It still honours each store's own
+                 marker -- a session you deleted in one account is not pushed
+                 back into it -- and, since it may not clear a marker either,
+                 it writes nothing at all into a store that holds any marker
+                 for that session, so it can never leave a record and a
+                 marker side by side. The one file an applying run does
+                 remove is its own temp file (a leftover from a killed run,
+                 or one it decided at the last moment not to use), named
+                 exactly .sync-<pid>-local_<id>.json.tmp -- nothing
+                 else, whatever its name. (--no-delete is still accepted as a
+                 deprecated no-op: it now describes the default.)
+--propagate-deletions:
+                 turns the deletion path on. A session is then gone when a
+                 deleted_<uuid> marker really exists and is at least as new
+                 as the winning record: the record is removed from every
+                 store and the marker is copied there. An older marker is
+                 stale and gets cleared instead. A marker is only ever copied
+                 into other stores when NO store holds a file for that
+                 session -- a file that exists but could not be interpreted
+                 blocks it, because a marker written next to a live record
+                 hides the session for good. Stale markers are cleared
+                 before any record is written, and if the backup fails the
+                 whole destructive part is cancelled together with every
+                 write into a store that still holds a marker for that
+                 session, so this mode never creates that pair either
+unreadable file: a record or marker caught half-written is skipped for that run
+                 rather than guessed at, so a damaged file neither deletes a
+                 session nor brings a deleted one back; the dry run lists them.
+                 A record whose sessionId field contradicts its own file name,
+                 whose lastActivityAt is not a plausible millisecond value
+                 (before 2001, or more than a day ahead of this machine's
+                 clock), or that has no cliSessionId (nothing for another
+                 account to resume) is skipped and reported the same way. A
+                 destination copy that cannot be read, cannot be dated, or
+                 whose sessionId names a different session is never
+                 overwritten or removed. A deleted_<uuid> entry that is not a
+                 regular file (a directory, a symlink, a fifo) is a marker
+                 that cannot be read: that session is left alone everywhere
+                 and reported, and the entry is never touched. A store
+                 DIRECTORY that cannot be listed is not an empty store: the
+                 whole store is dropped from the run
+profiles:        an extra profile under ~/.claude-profiles counts as a live
+                 store only when its name is not a parked copy, it really is
+                 an app profile directory (it has a config.json), and it is
+                 either registered in accounts.tsv (`claude-multi list`
+                 refreshes that from e-mail-named, signed-in profiles) or the
+                 app itself has written one of its own files there in the
+                 last 30 days -- this tool's writes into the session store do
+                 not count. Anything else is a snapshot: not read, not
+                 written, and its markers are ignored. The run names it once,
+                 with the remedy
+backups:         taken automatically before anything is deleted and before the
+                 first apply, into ~/.claude/backups/; only the index files,
+                 never a transcript. A backup that does not contain every file
+                 the run could destroy counts as failed, and nothing is deleted
+                 on a run without a backup; any other file it cannot copy is
+                 left out with a warning. Newest 7 kept, and one younger than
+                 24h is kept too - up to a hard cap of 28, above which the
+                 oldest go even if younger. Never pruned, cap or not: the 3
+                 NEWEST taken before a deletion or a --restore, and the very
+                 first of those. An unchanged recent backup is reused
+                 instead of rewritten
+restoring:       --restore-list to see them, --restore <timestamp> to copy one
+                 back. It is a rollback: before copying anything it says how
+                 many current records are newer than the backup's copy and
+                 will be rolled back, and it first backs up the current state
+                 of every store it writes into (it does not start if it
+                 cannot). It also clears the deletion markers of the sessions
+                 it revives, so the next sync will not undo it
+visibility:      Claude Desktop reads the session list only at startup and on
+                 account switch, so synced sessions show up after a restart
+privacy:         the dry run prints your own session titles and profile names;
+                 redact it before pasting it into a bug report
+
+duration units:  s=seconds m=minutes h=hours d=days (case-insensitive)
+                 examples: --every 20s | 1m | 1m30s | 2h | 30d
+"""
+
+
+def main():
+    global QUIET
+    # Session titles and paths can hold any character. Under a non-UTF-8
+    # locale (ISO8859-1, US-ASCII, SJIS...) printing one used to raise
+    # UnicodeEncodeError and abort the dry run or --restore before it did
+    # anything. Files are always written as UTF-8; this only makes the
+    # terminal output degrade to escapes instead of crashing.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+    ap = argparse.ArgumentParser(
+        prog="claude-sessions-sync",
+        description="Keep the Claude Code session list identical across Claude "
+                    "Desktop accounts and profiles.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true",
+                    help="apply the changes (without it this is a dry run)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="log only when something changed (used by the background job)")
+    ap.add_argument("--propagate-deletions", dest="propagate_deletions",
+                    action="store_true",
+                    help="opt in to the deletion path: a session whose marker is "
+                         "at least as new as the winning record is removed from "
+                         "every store and the marker is copied there. Without "
+                         "this flag no record or marker is ever unlinked")
+    ap.add_argument("--no-delete", dest="no_delete", action="store_true",
+                    help="deprecated no-op, kept so existing jobs keep working: "
+                         "not propagating deletions is now the default")
+    ap.add_argument("--every", "--interval", dest="every", metavar="DURATION",
+                    help="background job interval (default 1m). e.g. 20s, 1m, 1m30s, 2h, 30d")
+    ap.add_argument("--install", action="store_true",
+                    help="install or update the background job")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="remove the background job")
+    ap.add_argument("--status", action="store_true",
+                    help="interval, deletion mode, run count, recent log lines")
+    ap.add_argument("--restore-list", dest="restore_list", action="store_true",
+                    help="list the available automatic backups")
+    ap.add_argument("--restore", metavar="TIMESTAMP",
+                    help="copy a backup's files back into the matching stores")
+    a = ap.parse_args()
+    QUIET = a.quiet
+    # OPT-IN. The default may not remove anything, so the flag has to be
+    # asked for; --no-delete is only the old name of the default.
+    do_delete = bool(a.propagate_deletions)
+    if a.no_delete:
+        if a.propagate_deletions:
+            do_delete = False
+            msg = ("note: --no-delete (deprecated, and now the default) wins "
+                   "over --propagate-deletions: nothing will be deleted.")
+        else:
+            msg = ("note: --no-delete is deprecated and does nothing -- not "
+                   "propagating deletions is the default now.")
+        if not QUIET:
+            print(msg)
+    # Backups and logs hold session titles and working-directory paths, so
+    # everything this process creates stays private to the user.
+    os.umask(0o077)
+
+    def run():
+        if a.uninstall:
+            return uninstall()
+        if a.status:
+            return status()
+        if a.restore_list:
+            return restore_list()
+        if a.restore:
+            with Lock():
+                return restore(a.restore)
+        if a.install:
+            try:
+                interval = parse_interval(a.every) if a.every else 60
+            except ValueError as e:
+                print("error:", e)
+                return 1
+            return install(interval, do_delete)
+        if a.every:
+            print("note: --every only means something with --install; "
+                  "ignored for a single run.")
+        if not os.path.isdir(BASE):
+            print("session store not found:", BASE)
+            return 1
+        with Lock():
+            return sync(a.apply, do_delete)
+
+    try:
+        return run()
+    finally:
+        # Unconditional: a run that only ever raises still grows the logs, and
+        # that is precisely when the cap has to apply.
+        trim_log()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

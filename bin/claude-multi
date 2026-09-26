@@ -1,0 +1,1967 @@
+#!/bin/bash
+#
+# claude-multi - run several Claude Desktop accounts side by side on one Mac,
+# and keep the Claude Code session list identical in every one of them.
+#
+# Each profile is its own Electron user-data directory, so the login, the
+# cookies, the session-list store and the app preferences are private to it.
+# Everything under ~/.claude - transcripts, memory, skills, agents, CLAUDE.md -
+# stays shared, because it is not account-scoped in the first place.
+#
+# Use the account's full e-mail address as the profile name, so that
+# `claude-multi list` shows at a glance which profile is which account.
+#
+# Two things about this app that shape the whole design:
+#
+#   1. Sign-in. OAuth opens the system browser and comes back through the
+#      claude:// URL scheme. macOS hands that callback to the instance that
+#      registered first, i.e. the one launched first - not to the window that
+#      started the sign-in. So a BRAND NEW profile has to be the only running
+#      Claude instance while it signs in. That is a one-time cost per profile;
+#      afterwards every instance can run at the same time. `claude-multi setup`
+#      does this dance for you.
+#
+#   2. The session list is read from disk only at startup and on account
+#      switch - the app does not watch the directory. Sessions synced in the
+#      background therefore show up after a restart, not live.
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------- constants --
+
+APP_BUNDLE="/Applications/Claude.app"
+APP_BIN="$APP_BUNDLE/Contents/MacOS/Claude"
+APP_ICON="$APP_BUNDLE/Contents/Resources/electron.icns"
+
+# The main (unprofiled) Claude user-data directory.
+MAIN="$HOME/Library/Application Support/Claude"
+
+# Profile root. Deliberately space-free: profile paths end up in process
+# arguments and we parse them back out of `ps` output.
+ROOT="$HOME/.claude-profiles"
+
+# uuid<TAB>email. Self-learning: any profile whose name is an e-mail teaches
+# this map, so the main profile can be shown by e-mail too instead of a UUID.
+MAP="$ROOT/accounts.tsv"
+
+# Optionally copied from the main profile at profile creation - never silently,
+# see seed_mcp_wanted(). Not symlinked and not refreshed on every launch: the
+# app rewrites this file itself (it replaces a symlink with a plain file), so
+# re-seeding would wipe the profile's own edits.
+MCP_CONFIG="claude_desktop_config.json"
+SEED_FILES=("$MCP_CONFIG")
+
+LAUNCHD_LABEL="io.github.claude-multi.sync"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+BUNDLE_ID_PREFIX="io.github.claude-multi.profile"
+
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+# Finder's sidebar "Applications" points at /Applications, not ~/Applications,
+# so put launchers where the user will actually look. Admin-group accounts can
+# write there without sudo; fall back to ~/Applications when they cannot.
+#
+# Launcher bundles are named after the account and are readable by anyone with
+# access to the machine (and indexed by Spotlight). On a shared or regularly
+# screen-shared Mac, set CLAUDE_MULTI_LAUNCHER_DIR=~/Applications to keep the
+# addresses out of the shared folder.
+LAUNCHER_DIR="${CLAUDE_MULTI_LAUNCHER_DIR:-}"
+if [ -z "$LAUNCHER_DIR" ]; then
+    if [ -w /Applications ]; then
+        LAUNCHER_DIR="/Applications"
+    else
+        LAUNCHER_DIR="$HOME/Applications"
+    fi
+fi
+
+SETUP_SIGNIN_TIMEOUT=300 # seconds to wait for a sign-in to complete
+SETUP_POLL=2             # seconds between sign-in checks
+SETUP_GRACE_POLLS=2      # polls to ignore before believing a sign-in happened
+QUIT_TIMEOUT=20          # seconds to wait for instances to quit on their own
+DIALOG_TIMEOUT=120       # seconds before an unanswered dialog counts as "no"
+
+# Runtime switches (see the flag parsing in cmd_open / cmd_setup).
+SEED_MCP="ask"           # ask | yes | no  - copy the MCP config into a profile?
+SEED_MCP_EXPLICIT=0      # 1 when --with-mcp-config / --no-mcp-config was given
+SEEDED_MCP=0             # set when a copy actually happened
+ASSUME_YES=0             # -y: do not ask before creating a profile
+ALLOW_INSIDE_CLAUDE=0    # --allow-inside-claude: run setup anyway
+RESTART=0                # --restart: quit this profile's instance, then open it
+
+# -------------------------------------------------------------- AppleScript --
+
+# Every AppleScript this tool runs is defined once, here. The functions below
+# run exactly these strings and `selftest` compiles exactly these strings, so
+# the two cannot drift apart. Anything variable goes in as a run ARGUMENT
+# ("on run {...}"), never spliced into the source: a quote in a profile name
+# or a message would stop the script compiling, and osascript reports a
+# compile error with exit 1 - the same status as a user's Cancel.
+
+# ask_dialog(): message, OK-button label, title, timeout in seconds.
+AS_ASK_DIALOG='on run {m, b, t, g}
+set r to display dialog m buttons {"Cancel", b} cancel button "Cancel" default button "Cancel" with title t with icon caution giving up after (g as integer)
+if gave up of r then return "timeout"
+return button returned of r
+end run'
+
+# raise_pid(): a pid. See raise_pid() for why this needs no Accessibility grant.
+AS_RAISE_PID='on run {p}
+tell application "System Events" to tell (first process whose unix id is (p as integer)) to set frontmost to true
+end run'
+
+# quit_all(): the application's name. An argument rather than a literal
+# `tell application "Claude"`: with a literal name the compiler looks the
+# application up to load its terminology - it has to be installed, and for an
+# app without a static dictionary that can mean starting it - so the literal
+# form could not be compile-checked safely. `quit` is a core event and needs
+# no terminology, so the running behaviour is the same.
+AS_QUIT_APP='on run {a}
+tell application a to quit
+end run'
+
+# dialog_unavailable(): message, title.
+AS_NOTIFY='on run {m, t}
+display notification m with title t
+end run'
+
+# The dialog a generated launcher shows when claude-multi is gone. It is baked
+# into the stub as literal text inside single quotes, so it takes no
+# arguments and must never contain a single quote itself.
+AS_LAUNCHER_MISSING='display dialog "claude-multi is not installed any more, so this launcher cannot open the profile.
+
+Re-run install.sh in your claude-multi-account checkout." buttons {"OK"} default button "OK" with title "Claude profile" with icon caution giving up after 120'
+
+# ------------------------------------------------------------------ helpers --
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+have_tty() { [ -t 0 ] && [ -t 1 ]; }
+
+fmt_elapsed() { printf '%d:%02d' $(($1 / 60)) $(($1 % 60)); }
+
+# Absolute path of this script, with symlinks resolved, so that a launcher
+# generated today still points at the real file when the CLI is reached through
+# a symlink in /usr/local/bin. (No `readlink -f`: not portable to older macOS.)
+resolve_self() {
+    local p="${BASH_SOURCE[0]}" dir target
+    while [ -L "$p" ]; do
+        # `|| true` and the emptiness check: a readlink that loses the race
+        # with an unlink returns non-zero, and a bare assignment from it would
+        # abort the whole script under `set -e` before main() ever runs.
+        target=$(readlink "$p" 2>/dev/null || true)
+        [ -n "$target" ] || break
+        case "$target" in
+        /*) p="$target" ;;
+        *) p="$(dirname "$p")/$target" ;;
+        esac
+    done
+    dir=$(cd "$(dirname "$p")" && pwd)
+    printf '%s/%s\n' "$dir" "$(basename "$p")"
+}
+SELF="$(resolve_self)"
+SELF_DIR="$(dirname "$SELF")"
+
+# Written into every generated launcher, and the thing launcher_is_stale looks
+# for: it changes whenever the stub layout or the fallback path changes, so an
+# out-of-date launcher is detected and regenerated.
+LAUNCHER_STAMP="# generated by claude-multi (stub v5); fallback: $SELF"
+
+# Profile names travel into process arguments, plist values, an AppleScript
+# string and a generated shell script, so keep them to characters that are safe
+# everywhere. The allowed set covers every address a real mailbox can have.
+check_name() {
+    local name="$1"
+    [ -n "$name" ] || die "profile name required"
+    case "$name" in
+    */*) die "invalid profile name (contains '/'): $name" ;;
+    .*) die "invalid profile name (starts with '.'): $name" ;;
+    # a mistyped option ("app --restart") must not become a profile named
+    # "--restart" whose launcher would then run "open --restart"
+    -*) die "invalid profile name (starts with '-'): $name - is it an option in the wrong place?" ;;
+    *' '*) die "invalid profile name (contains a space): $name" ;;
+    esac
+    case "$name" in
+    *[!A-Za-z0-9._%+@-]*)
+        die "invalid profile name: $name
+       allowed characters: letters, digits and  . _ % + @ -"
+        ;;
+    esac
+}
+
+is_email_shaped() { case "$1" in *@*.*) return 0 ;; *) return 1 ;; esac; }
+
+# Not an error - just a nudge, because `list` is far more readable when the
+# profile name is the account it holds.
+hint_if_not_email() {
+    if is_email_shaped "$1"; then return 0; fi
+    echo "hint: profile names work best as the full e-mail address of the"
+    echo "      account (e.g. work@example.com); 'list' then shows which"
+    echo "      profile holds which account."
+}
+
+# A bundle identifier has to be unique per profile. Collapsing every
+# non-alphanumeric to '-' is not injective - a.b@example.com and a-b@example.com
+# would collide, and LaunchServices keys on the identifier, so the Dock and
+# Spotlight would open the wrong profile - hence the digest suffix.
+slug_of() {
+    # printf, not echo: `echo | tr -c` turns the trailing newline into a '-'
+    # and every bundle id would end in a stray dash.
+    local base digest
+    base=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | tr -s '-' |
+        sed -e 's/^-*//' -e 's/-*$//')
+    # `|| true` plus a fallback: if shasum is ever missing the substitution
+    # would fail, and with `set -e -o pipefail` that takes the script down
+    # instead of producing a bundle id.
+    digest=$(printf '%s' "$1" | shasum 2>/dev/null | cut -c1-6 || true)
+    printf '%s-%s\n' "${base:-profile}" "${digest:-nodigest}"
+}
+
+# ------------------------------------------------------------------ python ---
+
+PYTHON=""
+PYTHON_PROBED=0
+
+# /usr/bin/python3 exists and is executable even when the Command Line Tools
+# are not installed: it is a stub that pops the "install developer tools"
+# dialog and prints nothing. Probe by running it, never by testing -x.
+python_bin() {
+    local c
+    if [ "$PYTHON_PROBED" = 1 ]; then
+        [ -n "$PYTHON" ] || return 1
+        printf '%s\n' "$PYTHON"
+        return 0
+    fi
+    PYTHON_PROBED=1
+    for c in /usr/bin/python3 python3; do
+        if command -v "$c" >/dev/null 2>&1 && "$c" -c 'pass' >/dev/null 2>&1; then
+            PYTHON=$(command -v "$c")
+            printf '%s\n' "$PYTHON"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# --------------------------------------------------------------- processes --
+
+# NOTE: never write `ps ... | grep -q`. With `set -o pipefail`, grep exits on
+# the first match, ps takes SIGPIPE and the whole pipeline reports failure,
+# which kills the script. Capture the output first, match it afterwards.
+#
+# The same trap, the other way round, is what makes a tool look BROKEN rather
+# than noisy: `pid=$(ps ... | grep ... | awk ...)`. With no match grep exits 1,
+# pipefail hands that to the command substitution, the assignment fails and
+# `set -e` ends the script - exit 1, no output, nothing done. Every helper here
+# that answers "which process is that?" therefore ends in a pipeline that
+# cannot fail (`|| true`) and reports "nothing" as empty output and status 0.
+# `selftest` checks exactly that, on a machine where nothing matches.
+#
+# Match the EXECUTABLE, never the command line. On macOS `ps -o comm=` prints
+# the executable's path, so a process that merely mentions APP_BIN in its
+# arguments (an editor, a grep, a script like this one) can never be mistaken
+# for Claude - which matters because quit_all() sends these PIDs SIGTERM and
+# then SIGKILL. The --user-data-dir flag lives in the argument vector and is
+# read separately, per PID, in running_dirs().
+claude_pids() {
+    local out
+    out=$(ps -eo pid=,comm= 2>/dev/null || true)
+    [ -n "$out" ] || return 0
+    printf '%s\n' "$out" |
+        awk -v bin="$APP_BIN" '{ pid = $1; sub(/^[ \t]*[0-9]+[ \t]+/, ""); if ($0 == bin) print pid }'
+}
+
+claude_count() {
+    local pids
+    pids=$(claude_pids)
+    if [ -z "$pids" ]; then
+        echo 0
+    else
+        printf '%s\n' "$pids" | wc -l | tr -d ' '
+    fi
+}
+
+argv_of() { ps -o command= -p "$1" 2>/dev/null || true; }
+
+# The user-data directory of every running instance, one per line. The value is
+# cut at the first space: ROOT is space-free by design (see the note above it)
+# precisely so the path can be read back out of an argument vector, and a
+# greedy match would swallow every flag that follows it.
+running_dirs() {
+    local pids pid cmd
+    pids=$(claude_pids)
+    [ -n "$pids" ] || return 0
+    for pid in $pids; do
+        cmd=$(argv_of "$pid")
+        [ -n "$cmd" ] || continue
+        printf '%s\n' "$cmd" | sed -n 's/.*--user-data-dir=\([^ ]*\).*/\1/p'
+    done
+}
+
+is_running() {
+    local dirs
+    dirs=$(running_dirs)
+    # Here-string, not a pipe: nothing can take SIGPIPE when grep -q exits early.
+    grep -Fxq -- "$1" <<<"$dirs"
+}
+
+# The pid of the instance running with this user-data directory, or nothing.
+#
+# Called as `pid=$(pid_for_dir "$dir")`, so "not running" MUST be empty output
+# and status 0 - see the note at the top of this section. Every pipeline in
+# here ends in `|| true` for that reason: `head` closing the pipe early makes
+# `sed` take SIGPIPE, and pipefail would turn a perfectly normal "no instance
+# is running" into a silent exit.
+pid_for_dir() { # dir
+    local dir="$1" pids pid cmd d
+    pids=$(claude_pids)
+    [ -n "$pids" ] || return 0
+    for pid in $pids; do
+        cmd=$(argv_of "$pid")
+        [ -n "$cmd" ] || continue
+        d=$(printf '%s\n' "$cmd" | sed -n 's/.*--user-data-dir=\([^ ]*\).*/\1/p' | head -n 1 || true)
+        if [ -n "$d" ] && [ "$d" = "$dir" ]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Bring a running instance to the front, by pid so that the right one of
+# several same-bundle instances is addressed.
+#
+# `set frontmost to true` on a System Events process does NOT need the
+# Accessibility permission. Asking that process anything about its windows
+# ("count windows", "get windows") DOES, and is denied with an error on a
+# machine that never granted it - so the state of the instance's windows is
+# deliberately never inspected here, and the caller offers a restart instead
+# of trying to work out whether a window exists.
+#
+# The pid goes in as a run ARGUMENT, like every other script in this file:
+# nothing is spliced into AppleScript source.
+raise_pid() { # pid
+    osascript -e "$AS_RAISE_PID" -- "$1" >/dev/null 2>&1
+}
+
+# Stop ONE instance - unlike quit_all(), which addresses the app by name and
+# therefore cannot aim. Returns non-zero if the process is somehow still there.
+quit_pid() { # pid
+    local pid="$1" waited=0
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    while [ "$waited" -lt "$QUIT_TIMEOUT" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then return 1; fi
+    return 0
+}
+
+# An instance with no --user-data-dir flag is the main profile.
+main_running() {
+    local pids pid cmd
+    pids=$(claude_pids)
+    [ -n "$pids" ] || return 1
+    for pid in $pids; do
+        cmd=$(argv_of "$pid")
+        [ -n "$cmd" ] || continue
+        case "$cmd" in
+        *--user-data-dir=*) ;;
+        *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Ask every Claude instance to quit, wait, then insist. Returns 0 when nothing
+# is left running.
+quit_all() {
+    local waited=0 pids pid
+    if [ "$(claude_count)" = 0 ]; then return 0; fi
+    # Two reasons this loop re-sends the quit event instead of sending it once:
+    #   - `tell application ... to quit` LAUNCHES the app when it is not
+    #     already running, so it must never be sent to an empty machine (hence
+    #     the check above, and the one at the top of every iteration);
+    #   - AppleScript addresses the app by name, and with several instances of
+    #     the same bundle open a single quit event does not necessarily reach
+    #     all of them.
+    while [ "$waited" -lt "$QUIT_TIMEOUT" ]; do
+        if [ "$(claude_count)" = 0 ]; then return 0; fi
+        if [ $((waited % 5)) = 0 ]; then
+            osascript -e "$AS_QUIT_APP" -- "Claude" >/dev/null 2>&1 || true
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    pids=$(claude_pids)
+    if [ -n "$pids" ]; then
+        echo "  some instances did not quit in ${QUIT_TIMEOUT}s; stopping them."
+        for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+        sleep 3
+        pids=$(claude_pids)
+        for pid in $pids; do kill -KILL "$pid" 2>/dev/null || true; done
+        sleep 1
+    fi
+    [ "$(claude_count)" = 0 ]
+}
+
+# `setup` quits every Claude Desktop window - including the one hosting a
+# Claude Code session. Run from inside such a session it would kill the agent
+# executing it, half way through the wizard. Detect the likely cases and refuse.
+inside_claude_code() { [ -n "${CLAUDECODE:-}" ] || [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]; }
+
+claude_desktop_ancestor() {
+    local pid="${PPID:-0}" depth=0 comm parent
+    while [ "$depth" -lt 12 ]; do
+        case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+        [ "$pid" -gt 1 ] || return 1
+        comm=$(ps -o comm= -p "$pid" 2>/dev/null || true)
+        case "$comm" in
+        "$APP_BUNDLE"/*) return 0 ;;
+        esac
+        parent=$(ps -o ppid= -p "$pid" 2>/dev/null || true)
+        pid=$(printf '%s' "$parent" | tr -d '[:space:]')
+        depth=$((depth + 1))
+    done
+    return 1
+}
+
+refuse_inside_claude() {
+    local why=""
+    if [ "$ALLOW_INSIDE_CLAUDE" = 1 ]; then return 0; fi
+    if inside_claude_code; then why="inside a Claude Code session"; fi
+    if claude_desktop_ancestor; then why="inside a process started by Claude Desktop"; fi
+    [ -n "$why" ] || return 0
+    cat >&2 <<TXT
+error: refusing to run setup $why.
+
+  Setup quits EVERY Claude Desktop window, several times over. If this shell
+  is hosted by Claude Desktop, that kills the session running the command -
+  and this script with it, in the middle of the sign-in dance.
+
+  Open Terminal.app and run:  claude-multi setup
+
+  If you are certain this shell will survive it (for example a plain terminal
+  that only inherited the environment), re-run with --allow-inside-claude.
+TXT
+    exit 1
+}
+
+# ----------------------------------------------------------------- accounts --
+
+# The profile root and everything in it hold live logins. macOS home
+# directories are group-readable, so the default umask would let every other
+# local user walk in.
+ensure_root() {
+    mkdir -p "$ROOT"
+    chmod 700 "$ROOT" 2>/dev/null || true
+}
+
+# Which account a profile is signed in to: lastKnownAccountUuid in its own
+# config.json. Empty when the profile has never signed in.
+uuid_of() {
+    local cfg="$1/config.json" py
+    if [ ! -f "$cfg" ]; then
+        echo ""
+        return 0
+    fi
+    if ! py=$(python_bin); then
+        echo ""
+        return 0
+    fi
+    "$py" -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("lastKnownAccountUuid") or "")
+except Exception: print("")' "$cfg" 2>/dev/null || echo ""
+}
+
+email_of() {
+    local uuid="$1" hit
+    if [ -z "$uuid" ]; then
+        echo "-"
+        return 0
+    fi
+    if [ -f "$MAP" ]; then
+        # `|| true`: an unreadable or vanished map is a label problem, not a
+        # reason for `set -e` to end a `list` half way down the table.
+        hit=$(awk -v u="$uuid" '$1==u {print $2; exit}' "$MAP" 2>/dev/null || true)
+        if [ -n "$hit" ]; then
+            echo "$hit"
+            return 0
+        fi
+    fi
+    echo "${uuid:0:8}"
+}
+
+# Record uuid -> e-mail. The map is learned from a name the user chose, so a
+# row can be wrong (a profile called work@example.com signed into the personal
+# account). Rows are therefore CORRECTABLE: the newest observation wins, and
+# the file is replaced atomically so a concurrent reader never sees half of it.
+learn() { # uuid email
+    local uuid="$1" email="$2" cur tmp
+    [ -n "$uuid" ] && [ -n "$email" ] || return 0
+    is_email_shaped "$email" || return 0
+    ensure_root
+    if [ ! -f "$MAP" ]; then
+        : >"$MAP"
+        chmod 600 "$MAP" 2>/dev/null || true
+    fi
+    cur=$(awk -v u="$uuid" '$1==u {print $2; exit}' "$MAP" 2>/dev/null || true)
+    if [ "$cur" = "$email" ]; then return 0; fi
+    if [ -n "$cur" ]; then
+        echo "note: account ${uuid:0:8} was recorded as $cur; relabelling it $email." >&2
+    fi
+    tmp="$MAP.tmp.$$"
+    # An `if`, not a bare group: should awk fail to read the map, the group
+    # would still have written the new row to $tmp and the mv would then
+    # replace every learned label with that single line. Rewrite only what was
+    # rewritten in full - and never let the failure end the script either.
+    if { awk -v u="$uuid" '$1!=u' "$MAP" 2>/dev/null && printf '%s\t%s\n' "$uuid" "$email"; } >"$tmp"; then
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$MAP"
+        chmod 600 "$MAP" 2>/dev/null || true
+    else
+        rm -f "$tmp" 2>/dev/null || true
+        echo "note: could not update $MAP; leaving the existing labels alone." >&2
+    fi
+}
+
+# Teach the map from every profile whose name is an e-mail address. When two
+# profiles report the SAME account there is no way to tell which name is the
+# right label for it, so say so and leave the existing row alone.
+learn_all() {
+    local d name uuid pairs="" dups="" u n
+    for d in "$ROOT"/*/; do
+        [ -d "$d" ] || continue
+        d="${d%/}"
+        name=$(basename "$d")
+        is_email_shaped "$name" || continue
+        uuid=$(uuid_of "$d")
+        [ -n "$uuid" ] || continue
+        case "$pairs" in
+        *"$uuid "*) dups="$dups$uuid " ;;
+        esac
+        pairs="$pairs$uuid $name"$'\n'
+    done
+    [ -n "$pairs" ] || return 0
+    while IFS=' ' read -r u n; do
+        [ -n "$u" ] || continue
+        case "$dups" in *"$u "*) continue ;; esac
+        learn "$u" "$n"
+    done <<<"$pairs"
+    if [ -n "$dups" ]; then
+        echo "note: more than one profile is signed in to the same account;" >&2
+        echo "      leaving accounts.tsv as it is. Reset it with: rm \"$MAP\"" >&2
+    fi
+}
+
+account_of() { email_of "$(uuid_of "$1")"; }
+
+# Unique session records in a store. The same session is mirrored once per
+# account folder, so count distinct file names, and skip the app's own .bak
+# copies.
+#   - `|| true`: find fails when the directory does not exist and pipefail
+#     would abort the script.
+#   - `-not -name`, not `-not -path`: ".bak" is a property of the record's file
+#     name. A profile legitimately called x.bak@example.com would otherwise
+#     exclude its own directory and report 0 sessions forever.
+#   - `sed`, not `xargs -n1 basename`: xargs splits on the space in
+#     "Application Support".
+count_sessions() {
+    { find "$1" -name 'local_*.json' -not -name '*.bak*' 2>/dev/null || true; } |
+        sed 's|.*/||' | sort -u | wc -l | tr -d ' '
+}
+
+# The newest state of a profile's session store, used to notice a sign-in.
+# Empty when the store does not exist yet.
+store_stamp() {
+    local store="$1/claude-code-sessions"
+    [ -d "$store" ] || {
+        echo ""
+        return 0
+    }
+    stat -f '%m' "$store" 2>/dev/null || echo ""
+}
+
+# ----------------------------------------------------------------- launcher --
+
+launcher_path() { printf '%s/Claude - %s.app\n' "$LAUNCHER_DIR" "$1"; }
+
+# A ~1 MB wrapper bundle - almost all of it the copied icon, the stub itself is
+# a few hundred bytes - NOT a copy of Claude.app (that is ~900 MB). It only
+# execs `claude-multi open <name>`, so Spotlight, Launchpad and the Dock can
+# open a specific account. `open`, not the bare name: the dispatcher accepts a
+# bare word only when it is address-shaped, so a launcher for any other
+# profile name would exit 1 - silently, since Finder shows no stderr.
+#
+# The stub prefers a stable entry point (the symlink install.sh puts on your
+# PATH) over the checkout it was generated from, so moving the repository does
+# not break every launcher at once. Finder hands apps a bare PATH, so the
+# directories are spelled out instead of using `command -v`.
+#
+# Returns non-zero when anything could not be written - callers must check.
+make_launcher() {
+    local name="$1" app id
+    app=$(launcher_path "$name")
+    id=$(slug_of "$name")
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" || return 1
+    cat >"$app/Contents/MacOS/launch" <<LAUNCHEOF || return 1
+#!/bin/bash
+$LAUNCHER_STAMP
+# An app opened from Finder, the Dock or Spotlight does not inherit shell
+# variables, so CLAUDE_MULTI_LAUNCHER_DIR set in a shell rc never reaches us.
+# Tell claude-multi where this launcher lives instead, so a launcher it
+# regenerates goes back into the same folder (and a launcher kept out of
+# /Applications for privacy stays out of it).
+if [ -z "\${CLAUDE_MULTI_LAUNCHER_DIR:-}" ]; then
+    here=\$(cd "\$(dirname "\$0")/../../.." 2>/dev/null && pwd) || here=""
+    if [ -n "\$here" ]; then export CLAUDE_MULTI_LAUNCHER_DIR="\$here"; fi
+fi
+for cm in /usr/local/bin/claude-multi "\$HOME/.local/bin/claude-multi" \\
+    "\$HOME/bin/claude-multi" /opt/homebrew/bin/claude-multi "$SELF"; do
+    if [ -x "\$cm" ]; then exec "\$cm" open "$name"; fi
+done
+osascript -e '$AS_LAUNCHER_MISSING' >/dev/null 2>&1 || true
+exit 1
+LAUNCHEOF
+    chmod +x "$app/Contents/MacOS/launch" || return 1
+    if [ -f "$APP_ICON" ]; then
+        cp "$APP_ICON" "$app/Contents/Resources/icon.icns" || return 1
+    fi
+    cat >"$app/Contents/Info.plist" <<PLISTEOF || return 1
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>Claude - $name</string>
+    <key>CFBundleDisplayName</key><string>Claude - $name</string>
+    <key>CFBundleIdentifier</key><string>$BUNDLE_ID_PREFIX.$id</string>
+    <key>CFBundleExecutable</key><string>launch</string>
+    <key>CFBundleIconFile</key><string>icon</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>LSBackgroundOnly</key><false/>
+</dict>
+</plist>
+PLISTEOF
+    # Ad-hoc sign the finished bundle. An unsigned bundle is re-evaluated by
+    # Gatekeeper on EVERY launch: measured ~1.7s from double-click to first
+    # process against ~0.5s once signed, and the very first launch after it is
+    # written is far worse than either. Signing is the whole difference between
+    # "the launcher is slow" and "the launcher is instant".
+    #
+    # Last, because it seals the contents: the stub, the icon and Info.plist
+    # must all be in place first. `|| true` because codesign ships with the
+    # Command Line Tools and may be absent - a slow launcher still works, so
+    # this is an optimisation, never a reason to fail. `touch` afterwards only
+    # changes the directory's mtime, which is not part of the seal.
+    codesign --force --deep --sign - "$app" >/dev/null 2>&1 || true
+    # Tell LaunchServices about it so Spotlight indexes the new name.
+    "$LSREGISTER" -f "$app" >/dev/null 2>&1 || true
+    touch "$app" 2>/dev/null || true
+    printf '%s\n' "$app"
+}
+
+# Is this bundle signed at all? `-dv` (display) rather than `-v` (verify):
+# the question is whether Gatekeeper will have to re-evaluate it, not whether
+# the seal still matches. Returns non-zero when codesign is missing too, so
+# callers must check codesign_available() first when a "no" would be reported
+# to the user as a problem.
+codesign_available() { command -v codesign >/dev/null 2>&1; }
+launcher_is_signed() { # app bundle path
+    codesign -dv -- "$1" >/dev/null 2>&1
+}
+
+# Create or refresh the launcher and report it. Never let a failure look like
+# success: make_launcher's status is invisible inside "$(...)" in an echo.
+refresh_launcher() { # name indent
+    local name="$1" indent="${2:-}" app
+    if [ -d "$(launcher_path "$name")" ] && ! launcher_is_stale "$name"; then
+        return 0
+    fi
+    if app=$(make_launcher "$name"); then
+        echo "${indent}launcher: $app  (Spotlight: 'Claude - $name')"
+    else
+        echo "${indent}warning: could not create the launcher in $LAUNCHER_DIR"
+        return 1
+    fi
+}
+
+# Stale = the launcher was generated by a different copy or an older version of
+# this CLI (repo moved, installed elsewhere, stub layout changed).
+launcher_is_stale() {
+    local app launch
+    app=$(launcher_path "$1")
+    launch="$app/Contents/MacOS/launch"
+    [ -f "$launch" ] || return 0
+    # An `if`, not `grep ... && return 1`: with `set -e` a bare AND-list that
+    # fails takes the script down with it.
+    if grep -Fqx -- "$LAUNCHER_STAMP" "$launch"; then return 1; fi
+    return 0
+}
+
+# ------------------------------------------------------------------ dialogs --
+
+# Say - on every channel that might still work - that the question could not
+# be put to the user at all. Best effort: when the dialog could not be shown,
+# the notification may not get through either, so the stderr lines matter.
+dialog_unavailable() { # title rc detail
+    local title="$1" rc="$2" detail="$3"
+    osascript -e "$AS_NOTIFY" \
+        -- "claude-multi could not show a confirmation dialog - run it from Terminal.app." \
+        "$title" >/dev/null 2>&1 || true
+    echo "error: the confirmation dialog could not be shown (osascript exit $rc)." >&2
+    if [ -n "$detail" ]; then
+        # `|| true`: this runs under `set -e -o pipefail` and the whole point
+        # of this function is to report a failure, not to become one.
+        printf '%s\n' "$detail" | sed 's/^/       /' >&2 || true
+    fi
+    echo "       Nothing was created or changed. Answer it in a terminal instead:" >&2
+    echo "       claude-multi open <name>" >&2
+}
+
+# Ask a yes/no question with a macOS dialog, for the Finder/Dock case where
+# there is no terminal to read from.
+#   0 = yes
+#   1 = no      - Cancel, or nobody answered within DIALOG_TIMEOUT seconds
+#   2 = unknown - the dialog could not be shown at all (osascript missing, no
+#                 window server, a TCC denial, a broken script)
+# A refusal and a breakage must not look the same, so callers get three
+# answers rather than two and give each one its own exit path.
+#
+# The message, the button label, the title and the timeout are handed to the
+# script as ARGUMENTS ("on run {m, b, t, g}"); nothing is spliced into its
+# source. Splicing is what broke this before: a message containing a double
+# quote closes the AppleScript string literal, the script stops compiling, and
+# osascript reports that with exit 1 - the very status a user cancel uses, so
+# the crash was indistinguishable from a "no". As arguments, no message text
+# reaches the AppleScript parser at all. `g as integer` because run arguments
+# always arrive as text.
+#
+# osascript exits 1 both for a cancel (error -128) and for every other error,
+# so keep stderr (2>&1) and let its text tell the two apart.
+#
+# THE EXIT STATUS IS NOT THE ANSWER. `display dialog ... giving up after N`
+# exits 0 when nobody answered - the record just carries `gave up:true` - so
+# code that reads the status alone treats an auto-dismissed dialog as a click
+# on the default button. The script below therefore decides inside AppleScript
+# and returns one unambiguous word:
+#
+#   "timeout"  -> `gave up of r`, nobody was there
+#   $ok        -> the button was actually clicked
+#   (exit 1, error -128) -> Cancel; `cancel button` raises rather than returns,
+#                           so $ok is the only thing a click can ever produce
+#
+# Matching a word is also why the record's printed form is never parsed: a
+# button label or a message containing "gave up:true" cannot fake an answer.
+ask_dialog() { # message ok_button title
+    local msg="$1" ok="$2" title="$3" out="" rc=0
+    out=$(osascript -e "$AS_ASK_DIALOG" \
+        -- "$msg" "$ok" "$title" "$DIALOG_TIMEOUT" 2>&1) || rc=$?
+    if [ "$rc" = 0 ]; then
+        # Only an exact match on the button label is a yes. "timeout" - and
+        # anything unexpected - means nobody chose, i.e. do nothing.
+        if [ "$out" = "$ok" ]; then return 0; fi
+        return 1
+    fi
+    # Only -128 is a real refusal. A compile error, a missing window server or
+    # a TCC denial must never be read as "no". Match the number as well as the
+    # wording, which osascript localizes.
+    case "$out" in
+    *"-128"* | *"User canceled"* | *"User cancelled"*) return 1 ;;
+    esac
+    dialog_unavailable "$title" "$rc" "$out"
+    return 2
+}
+
+# ------------------------------------------------------------------ profile --
+
+signin_trap_text() {
+    cat <<'TXT'
+Signing in to a NEW profile needs it to be the only running Claude instance.
+macOS delivers the claude:// callback to whichever instance registered first,
+so with another one open the sign-in finishes in the wrong window and this
+profile stays empty.
+
+Correct order (once per profile):
+  1. quit every Claude window
+TXT
+    printf '  2. claude-multi %s        <- let this be the only one running\n' "$1"
+    cat <<'TXT'
+  3. sign in, then quit that window
+  4. repeat 2-3 for the next profile
+  5. open them all - from now on they run side by side
+
+Or let the wizard do all of it:  claude-multi setup
+TXT
+}
+
+# Called before opening a profile that is not signed in yet while other
+# instances are running. Returns non-zero when the user backs out.
+confirm_signin_trap() {
+    local name="$1" others="$2" ans rc=0
+    echo "WARNING: $others Claude instance(s) running."
+    echo
+    signin_trap_text "$name" | sed 's/^/  /'
+    echo
+    if have_tty; then
+        printf '  open it anyway? (y/N) '
+        read -r ans || ans=""
+        case "$ans" in
+        y | Y | yes | Yes) return 0 ;;
+        *)
+            echo "  cancelled."
+            return 1
+            ;;
+        esac
+    fi
+    # Opened from Finder/Dock: no terminal to read from, so ask with a dialog.
+    # Pass ask_dialog's answer through unchanged: 1 = backed out, 2 = the
+    # question could not be asked. cmd_open exits differently for each.
+    ask_dialog "New profile: $name
+
+$(signin_trap_text "$name")" "Open anyway" "Claude profile" || rc=$?
+    return "$rc"
+}
+
+# A profile is created on first open, so a typo would otherwise silently make
+# one. Ask first.
+confirm_create() {
+    local name="$1" ans rc=0
+    if [ "$ASSUME_YES" = 1 ]; then return 0; fi
+    if have_tty; then
+        echo "profile '$name' does not exist yet."
+        echo "creating it opens a brand-new Claude Desktop instance that you have"
+        echo "to sign in to; it does not copy the login of any existing profile."
+        printf 'create it? (y/N) '
+        read -r ans || ans=""
+        case "$ans" in
+        y | Y | yes | Yes) return 0 ;;
+        *)
+            echo "cancelled."
+            return 1
+            ;;
+        esac
+    fi
+    # The quotes around the name are safe: ask_dialog hands this whole string
+    # to osascript as an argument instead of pasting it into the script's
+    # source. Returns ask_dialog's own 0 / 1 / 2.
+    ask_dialog "Create a new Claude profile named \"$name\"?
+
+It starts empty and you will have to sign in to it." "Create" "Claude profile" || rc=$?
+    return "$rc"
+}
+
+# The MCP config lists your MCP servers and, in their env blocks, routinely the
+# API keys and tokens those servers use. Copying it puts a second copy of those
+# secrets on disk, so it is opt-in: --with-mcp-config / --no-mcp-config decide,
+# and with neither we ask on a terminal and default to NO. Never silent.
+#
+# The answer is remembered in SEED_MCP so that one profile's creation asks
+# once. It must NOT carry over to the next profile in the same `setup` run:
+# "you are asked before your keys are copied" is a promise per profile, not
+# per invocation. reset_seed_mcp() is what setup calls between accounts, and
+# it leaves an explicit --with-mcp-config / --no-mcp-config alone - that flag
+# IS the answer, given once for the whole run on purpose.
+reset_seed_mcp() {
+    if [ "$SEED_MCP_EXPLICIT" = 1 ]; then return 0; fi
+    SEED_MCP="ask"
+}
+
+seed_mcp_wanted() {
+    local ans
+    case "$SEED_MCP" in
+    yes) return 0 ;;
+    no) return 1 ;;
+    esac
+    if ! have_tty; then
+        echo "  not copying $MCP_CONFIG (nothing to ask on; use --with-mcp-config to copy it)."
+        SEED_MCP="no"
+        return 1
+    fi
+    echo
+    echo "  Copy your MCP server settings into this profile?"
+    echo "    from: $MAIN/$MCP_CONFIG"
+    echo "    That file lists your MCP servers and, in their env blocks, often"
+    echo "    the API keys, tokens and database URLs those servers use. Copying"
+    echo "    it leaves a second copy of those secrets under $ROOT/."
+    echo "    Answer no to start this profile with no MCP servers; you can copy"
+    echo "    or edit the file yourself later."
+    printf '  copy it? (y/N) '
+    read -r ans || ans=""
+    case "$ans" in
+    y | Y | yes | Yes)
+        SEED_MCP="yes"
+        return 0
+        ;;
+    *)
+        SEED_MCP="no"
+        return 1
+        ;;
+    esac
+}
+
+# Create the profile directory and seed it. Does not launch anything.
+create_profile() {
+    # Separate statements: /bin/bash on macOS is 3.2, where a later assignment
+    # in the same `local` cannot see an earlier one - with `set -u` it either
+    # aborts or, worse, silently picks up the caller's variable of that name.
+    local name="$1" f dir
+    dir="$ROOT/$name"
+    ensure_root
+    mkdir -p "$dir"
+    chmod 700 "$dir" 2>/dev/null || true
+    for f in "${SEED_FILES[@]}"; do
+        if [ -e "$MAIN/$f" ] && [ ! -e "$dir/$f" ]; then
+            if [ "$f" = "$MCP_CONFIG" ] && ! seed_mcp_wanted; then continue; fi
+            cp "$MAIN/$f" "$dir/$f"
+            chmod 600 "$dir/$f" 2>/dev/null || true
+            SEEDED_MCP=1
+        fi
+    done
+}
+
+# Start one instance, detached, and return at once. EVERY place this tool
+# starts Claude goes through here - `open` (and `claude-multi <email>`),
+# `open --restart`, and `setup`, both for the sign-in and for opening every
+# profile at the end - so these rules hold for all of them:
+#
+#   cwd "/"      Claude inherits the working directory of whatever starts it,
+#                and so does every MCP server it spawns (npx, node, ...).
+#                Started from a shell sitting in ~/Documents, ~/Desktop or
+#                ~/Downloads - folders macOS guards with TCC - node's getcwd()
+#                fails with EPERM (syscall uv_cwd) in each MCP server, and
+#                every one of them dies at startup. An instance started by
+#                LaunchServices (Dock, Finder) runs in "/", so that is what is
+#                used here too. `doctor` reports any instance that does not.
+#   stdin        from /dev/null. A detached instance that inherits the
+#                caller's stdin holds that pipe open for as long as it runs,
+#                so a terminal wrapper or an agent's tool call waiting for
+#                this command never sees it return. stdout and stderr go to
+#                /dev/null for the same reason.
+#
+# The subshell exits as soon as the instance is started, so the instance is
+# nobody's job and is reparented to launchd; there is nothing to `disown`.
+launch_profile() {
+    local dir="$1"
+    (
+        cd / || exit 1
+        nohup "$APP_BIN" --user-data-dir="$dir" </dev/null >/dev/null 2>&1 &
+    )
+}
+
+# Signed in = the profile knows which account it holds.
+#
+# The claude-code-sessions directory is NOT evidence of that: the app creates
+# it on first launch, so it is just as present in a profile that was opened
+# once and abandoned at the sign-in screen. Treating it as proof suppressed
+# the sign-in-trap warning for exactly the profiles the comment in cmd_open
+# says must be warned every time. It survives only as a last resort, for when
+# the account cannot be read at all (no working python3): there, assuming
+# "signed in" beats warning on every single open.
+profile_signed_in() {
+    local dir="$1"
+    if [ -n "$(uuid_of "$dir")" ]; then return 0; fi
+    if python_bin >/dev/null 2>&1; then return 1; fi
+    if [ -d "$dir/claude-code-sessions" ]; then return 0; fi
+    return 1
+}
+
+require_app() {
+    [ -x "$APP_BIN" ] || die "Claude Desktop not found at $APP_BUNDLE"
+}
+
+# -------------------------------------------------------------------- open ---
+
+# Closing the last window of a Claude instance does NOT quit it - the process
+# stays alive with no window on screen. Opening the profile again then found
+# "already running", printed one line and exited, so from the user's side
+# clicking the launcher did nothing at all, twice.
+#
+# So: raise the instance (which is what the user wanted in the common case),
+# say plainly that a running instance can be windowless, and offer a restart.
+# Whether it actually has a window cannot be checked - that needs the
+# Accessibility permission, see raise_pid().
+#
+# Returns 0 = restart it, 1 = nothing left to do, 2 = the question could not
+# be put to the user at all.
+handle_running() { # name pid
+    local name="$1" pid="$2" ans rc=0
+    echo "'$name' is already running (pid $pid)."
+    if raise_pid "$pid"; then
+        echo "  brought it to the front."
+    else
+        echo "  could not bring it to the front."
+    fi
+    echo "  Closing a Claude window does not quit the instance, so a profile can"
+    echo "  be running with nothing on screen. Restarting it gives you a window."
+    if have_tty; then
+        printf '  restart it now? (y/N) '
+        read -r ans || ans=""
+        case "$ans" in
+        y | Y | yes | Yes) return 0 ;;
+        *)
+            echo "  left it running - restart it any time with:"
+            echo "    claude-multi open $name --restart"
+            return 1
+            ;;
+        esac
+    fi
+    # From the Dock, Spotlight or a launcher: no terminal to answer in. The
+    # dialog defaults to Cancel and an unanswered one is a timeout, not a
+    # click - see ask_dialog(). Nothing is restarted unless someone says so.
+    ask_dialog "Claude is already running for \"$name\", and has been brought to the front.
+
+Closing a Claude window does not quit the instance, so this profile may be running with no window on screen. Restart it?" "Restart" "Claude profile" || rc=$?
+    return "$rc"
+}
+
+cmd_open() {
+    local name="" dir created=0 others rc=0 pid="" restarted=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        -y | --yes) ASSUME_YES=1 ;;
+        --restart) RESTART=1 ;;
+        --with-mcp-config)
+            SEED_MCP="yes"
+            SEED_MCP_EXPLICIT=1
+            ;;
+        --no-mcp-config)
+            SEED_MCP="no"
+            SEED_MCP_EXPLICIT=1
+            ;;
+        -*) die "unknown option: $1  (try: claude-multi help)" ;;
+        *)
+            [ -z "$name" ] || die "one profile at a time (got '$name' and '$1')"
+            name="$1"
+            ;;
+        esac
+        shift
+    done
+    check_name "$name"
+    require_app
+
+    dir="$ROOT/$name"
+    if [ -d "$dir" ]; then
+        pid=$(pid_for_dir "$dir")
+    fi
+    if [ -n "$pid" ]; then
+        if [ "$RESTART" = 1 ]; then
+            echo "'$name' is running (pid $pid) - quitting it."
+        else
+            rc=0
+            handle_running "$name" "$pid" || rc=$?
+            case "$rc" in
+            # 1 = raised, restart declined: the open request was satisfied.
+            # 2 = the dialog could not be shown; ask_dialog already said so
+            #     on stderr and in a notification. Keep that distinguishable.
+            1) exit 0 ;;
+            2) exit 2 ;;
+            esac
+        fi
+        if quit_pid "$pid"; then
+            echo "  stopped it."
+        else
+            die "could not stop pid $pid - quit that window by hand, then try again."
+        fi
+        restarted=1
+    elif [ "$RESTART" = 1 ] && [ -d "$dir" ]; then
+        echo "'$name' is not running; opening it."
+    fi
+
+    if [ ! -d "$dir" ]; then
+        hint_if_not_email "$name"
+        rc=0
+        confirm_create "$name" || rc=$?
+        # 1 = the user said no, and was told so. 2 = the question could not be
+        # put at all; ask_dialog has already explained that on stderr and in a
+        # notification. Exit differently, so a launcher, a wrapper or a log can
+        # tell "declined" from "the dialog is broken" - silently exiting 1 on a
+        # failed dialog is exactly the bug this two-way split exists to prevent.
+        case "$rc" in
+        0) ;;
+        1) exit 1 ;;
+        *) exit 2 ;;
+        esac
+        created=1
+    fi
+
+    # The sign-in trap is about SIGN-IN STATE, not about whether the directory
+    # happens to exist: a profile that was created but never signed in has to
+    # be warned about on every attempt until it is.
+    if ! profile_signed_in "$dir"; then
+        others=$(claude_count)
+        if [ "$others" -gt 0 ]; then
+            rc=0
+            confirm_signin_trap "$name" "$others" || rc=$?
+            case "$rc" in
+            0) ;;
+            1) exit 1 ;;
+            *) exit 2 ;;
+            esac
+        fi
+    fi
+
+    if [ "$created" = 1 ]; then create_profile "$name"; fi
+
+    launch_profile "$dir"
+
+    if [ "$created" = 1 ]; then
+        echo "created profile '$name', opening it."
+        echo "Sign in with $name on the screen that appears."
+        if [ "$SEEDED_MCP" = 1 ]; then
+            echo "MCP settings were copied from the main profile; memory, skills and"
+            echo "transcripts were already shared."
+        else
+            echo "MCP settings were NOT copied (add --with-mcp-config if you want them);"
+            echo "memory, skills and transcripts are shared already."
+        fi
+    elif [ "$restarted" = 1 ]; then
+        echo "restarted '$name'."
+    else
+        echo "opening '$name'."
+    fi
+    # Regenerate on every open, not only the first: a launcher goes stale when
+    # the checkout moves, and the user finds out by double-clicking it.
+    refresh_launcher "$name" "" || true
+    echo "profile directory: $dir"
+}
+
+# -------------------------------------------------------------------- list ---
+
+cmd_list() {
+    local main_state main_sess dirs d state found=0
+    dirs=$(running_dirs)
+    if main_running; then main_state="RUNNING"; else main_state="stopped"; fi
+
+    learn_all
+    main_sess=$(count_sessions "$MAIN/claude-code-sessions")
+
+    printf "%-28s %-9s %-28s %s\n" "PROFILE" "STATE" "ACCOUNT" "SESSIONS"
+    printf "%-28s %-9s %-28s %s\n" "main" "$main_state" "$(account_of "$MAIN")" "$main_sess"
+    for d in "$ROOT"/*/; do
+        [ -d "$d" ] || continue
+        found=1
+        d="${d%/}"
+        state="stopped"
+        if grep -Fxq -- "$d" <<<"$dirs"; then state="RUNNING"; fi
+        printf "%-28s %-9s %-28s %s\n" \
+            "$(basename "$d")" "$state" "$(account_of "$d")" "$(count_sessions "$d/claude-code-sessions")"
+    done
+    if [ "$found" = 0 ]; then
+        echo
+        echo "no extra profiles yet. try:  claude-multi setup work@example.com personal@example.com"
+    fi
+}
+
+# --------------------------------------------------------------------- app ---
+
+cmd_app() {
+    local name="${1:-}" app
+    [ $# -le 1 ] || die "app takes one profile name"
+    check_name "$name"
+    hint_if_not_email "$name"
+    # Always regenerate: this is the command people run to repair a launcher,
+    # so it must not quietly decide there is nothing to do. Assign first -
+    # inside "$(...)" in an echo argument the failure would be invisible.
+    if app=$(make_launcher "$name"); then
+        echo "launcher created: $app"
+        echo "Search Spotlight for 'Claude - $name', or drag it to the Dock."
+    else
+        die "could not create the launcher in $LAUNCHER_DIR"
+    fi
+    if [ ! -d "$ROOT/$name" ]; then
+        echo "note: the profile does not exist yet; it is created the first time you open it."
+    fi
+}
+
+# ------------------------------------------------------------------ remove ---
+
+cmd_remove() {
+    local name="${1:-}" dir size ans app
+    [ $# -le 1 ] || die "remove takes one profile name"
+    check_name "$name"
+    dir="$ROOT/$name"
+    [ -d "$dir" ] || die "no such profile: $name"
+    if is_running "$dir"; then
+        die "'$name' is running right now - quit that window first."
+    fi
+    # du fails on an unreadable subdirectory, and a bare assignment from a
+    # failing pipeline aborts the script under `set -e -o pipefail`. The size
+    # is decoration; swallow the status so ${size:-?} can do its job.
+    size=$({ du -sh "$dir" 2>/dev/null || true; } | awk '{print $1}')
+    echo "about to delete: $dir  (${size:-?})"
+    echo "note: this profile's session records are normally synced into the other"
+    echo "      profiles too. Any that were not - the sync skips this profile, or"
+    echo "      has not run since they were made - are lost with it."
+    app=$(launcher_path "$name")
+    if [ -d "$app" ]; then
+        echo "      its launcher will be removed too: $app"
+    fi
+    have_tty || die "refusing to delete without a confirmation - run this in a terminal."
+    printf 'type "yes" to confirm: '
+    read -r ans || ans=""
+    if [ "$ans" != "yes" ]; then
+        echo "cancelled."
+        exit 1
+    fi
+    rm -rf "$dir"
+    if [ -d "$app" ]; then rm -rf "$app"; fi
+    echo "deleted."
+}
+
+# -------------------------------------------------------------------- sync ---
+
+# The sync engine is a sibling of this script, so a git checkout and an
+# installed copy both work without configuration.
+find_sync() {
+    local c
+    for c in "$SELF_DIR/claude-sessions-sync" "$SELF_DIR/claude-sessions-sync.py"; do
+        if [ -f "$c" ]; then
+            printf '%s\n' "$c"
+            return 0
+        fi
+    done
+    if c=$(command -v claude-sessions-sync 2>/dev/null); then
+        printf '%s\n' "$c"
+        return 0
+    fi
+    return 1
+}
+
+run_sync() {
+    local sync py
+    sync=$(find_sync) || return 127
+    if [ -x "$sync" ]; then
+        "$sync" "$@"
+        return $?
+    fi
+    py=$(python_bin) || return 127
+    "$py" "$sync" "$@"
+}
+
+cmd_sync() {
+    local sync py
+    sync=$(find_sync) || die "claude-sessions-sync not found next to $SELF"
+    if [ -x "$sync" ]; then
+        exec "$sync" "$@"
+    fi
+    py=$(python_bin) || die "python3 not found (or it is the Command Line Tools stub) - run: xcode-select --install"
+    exec "$py" "$sync" "$@"
+}
+
+sync_job_installed() {
+    [ -f "$LAUNCHD_PLIST" ] || return 1
+    launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------ doctor ---
+
+# The working directory of a process, or nothing. lsof -Fn prints the path on
+# a line starting with "n". Every pipeline ends in `|| true`: "could not tell"
+# must come back as empty output and status 0, never end `doctor`.
+cwd_of() { # pid
+    local out
+    out=$(lsof -a -p "$1" -d cwd -Fn 2>/dev/null || true)
+    [ -n "$out" ] || return 0
+    printf '%s\n' "$out" | sed -n 's/^n//p' | head -n 1 || true
+}
+
+# The user-data directory a running instance was started with, or nothing
+# for the main profile. Same parsing as running_dirs().
+dir_of_pid() { # pid
+    local cmd
+    cmd=$(argv_of "$1")
+    [ -n "$cmd" ] || return 0
+    printf '%s\n' "$cmd" | sed -n 's/.*--user-data-dir=\([^ ]*\).*/\1/p' | head -n 1 || true
+}
+
+# doctor: every running instance should have "/" as its working directory -
+# see launch_profile(). One that does not was started some other way (by an
+# older version of this tool, or straight from a shell), and if that directory
+# is one macOS guards with TCC, its MCP servers fail with EPERM / uv_cwd.
+doctor_instance_cwd() {
+    local pids pid cwd dir who fix n=0 bad=0 unknown=0
+    pids=$(claude_pids)
+    if [ -z "$pids" ]; then
+        pass "instance cwd" "no instance running"
+        return 0
+    fi
+    if ! command -v lsof >/dev/null 2>&1; then
+        warn "instance cwd" "lsof not found - cannot check the working directory of running instances"
+        return 0
+    fi
+    for pid in $pids; do
+        n=$((n + 1))
+        cwd=$(cwd_of "$pid")
+        if [ -z "$cwd" ]; then
+            unknown=$((unknown + 1))
+            continue
+        fi
+        [ "$cwd" != / ] || continue
+        bad=$((bad + 1))
+        dir=$(dir_of_pid "$pid")
+        case "$dir" in
+        "")
+            who="main"
+            fix="quit Claude and start it again from the Dock or Finder"
+            ;;
+        "$ROOT"/*)
+            who=$(basename "$dir")
+            fix="claude-multi open $who --restart"
+            ;;
+        *)
+            who="$dir"
+            fix="quit it and start it again from /"
+            ;;
+        esac
+        warn "instance cwd" "$who (pid $pid) runs in $cwd, not / - its MCP servers fail with EPERM uv_cwd when that folder is TCC-protected; fix: $fix"
+    done
+    if [ "$bad" = 0 ]; then
+        if [ "$unknown" -gt 0 ]; then
+            warn "instance cwd" "$n running; could not read the working directory of $unknown"
+        else
+            pass "instance cwd" "$n running, all started in /"
+        fi
+    fi
+}
+
+DOCTOR_FAILED=0
+pass() { printf 'PASS  %-22s %s\n' "$1" "$2"; }
+warn() { printf 'WARN  %-22s %s\n' "$1" "$2"; }
+fail() {
+    printf 'FAIL  %-22s %s\n' "$1" "$2"
+    DOCTOR_FAILED=$((DOCTOR_FAILED + 1))
+}
+
+cmd_doctor() {
+    local n=0 stale=0 missing=0 loose=0 unsigned=0 d name app sync py perms delmode
+
+    if [ -x "$APP_BIN" ]; then
+        pass "Claude Desktop" "$APP_BUNDLE"
+    else
+        fail "Claude Desktop" "not found at $APP_BUNDLE"
+    fi
+
+    if py=$(python_bin); then
+        if [ "$py" = /usr/bin/python3 ]; then
+            pass "python3" "$py"
+        else
+            warn "python3" "$py (expected /usr/bin/python3)"
+        fi
+    elif [ -x /usr/bin/python3 ]; then
+        fail "python3" "/usr/bin/python3 runs nothing - it is the Command Line Tools stub; run: xcode-select --install"
+    else
+        fail "python3" "not found - the sync engine needs it"
+    fi
+
+    if [ -w "$LAUNCHER_DIR" ] || [ ! -e "$LAUNCHER_DIR" ]; then
+        pass "launcher location" "$LAUNCHER_DIR"
+    else
+        warn "launcher location" "$LAUNCHER_DIR is not writable"
+    fi
+
+    case "$ROOT" in
+    *' '*) fail "profile root" "$ROOT contains a space; profile paths are read back out of ps and must not" ;;
+    *) pass "profile root" "$ROOT" ;;
+    esac
+
+    if sync=$(find_sync); then
+        pass "sync engine" "$sync"
+    else
+        fail "sync engine" "claude-sessions-sync not found next to $SELF"
+    fi
+
+    # Deletions are opt-in in the sync engine: a plain run merges and never
+    # removes. Report which mode the INSTALLED job runs in, read from its own
+    # arguments, so nobody has to take the default on trust.
+    delmode="deletions not propagated (default)"
+    if [ -f "$LAUNCHD_PLIST" ] && grep -Fq -- "--propagate-deletions" "$LAUNCHD_PLIST"; then
+        delmode="deletions propagated (--propagate-deletions)"
+    fi
+    if sync_job_installed; then
+        pass "background sync" "$LAUNCHD_LABEL loaded; $delmode"
+    elif [ -f "$LAUNCHD_PLIST" ]; then
+        warn "background sync" "plist exists but the job is not loaded - run: claude-multi sync --install"
+    else
+        warn "background sync" "not installed - run: claude-multi sync --install"
+    fi
+
+    for d in "$ROOT"/*/; do
+        [ -d "$d" ] || continue
+        n=$((n + 1))
+        d="${d%/}"
+        name=$(basename "$d")
+        app=$(launcher_path "$name")
+        if [ ! -d "$app" ]; then
+            missing=$((missing + 1))
+        elif launcher_is_stale "$name"; then
+            stale=$((stale + 1))
+        elif codesign_available && ! launcher_is_signed "$app"; then
+            # Only counted when codesign exists: where it does not, there is
+            # nothing the user could do about it and a warning is just noise.
+            unsigned=$((unsigned + 1))
+        fi
+        perms=$(stat -f '%Lp' "$d" 2>/dev/null || echo "")
+        if [ -n "$perms" ] && [ "$perms" != 700 ]; then
+            loose=$((loose + 1))
+        fi
+    done
+
+    if [ "$n" = 0 ]; then
+        warn "profiles" "none yet - run: claude-multi setup"
+    else
+        pass "profiles" "$n in $ROOT"
+    fi
+
+    if [ "$loose" -gt 0 ]; then
+        warn "profile permissions" "$loose profile(s) readable by other local users - fix with: chmod -R go-rwx \"$ROOT\""
+    elif [ "$n" -gt 0 ]; then
+        pass "profile permissions" "private to you (0700)"
+    fi
+
+    if [ "$missing" = 0 ] && [ "$stale" = 0 ]; then
+        if [ "$n" -gt 0 ]; then pass "launchers" "all $n present and current"; fi
+    else
+        warn "launchers" "$missing missing, $stale stale (generated by another copy or an older version of this CLI) - fix with: claude-multi app <email>"
+    fi
+
+    if [ "$unsigned" -gt 0 ]; then
+        warn "launcher signature" \
+            "$unsigned launcher(s) unsigned - Gatekeeper re-checks an unsigned bundle on every launch (seconds, not milliseconds); fix with: claude-multi app <email>"
+    elif [ "$n" -gt 0 ] && [ "$missing" = 0 ] && [ "$stale" = 0 ] && codesign_available; then
+        pass "launcher signature" "ad-hoc signed"
+    fi
+
+    doctor_instance_cwd
+
+    # Warnings are things you may not care about; a FAIL means the tool cannot
+    # do its job, so say so in the exit status too.
+    if [ "$DOCTOR_FAILED" -gt 0 ]; then
+        echo
+        echo "$DOCTOR_FAILED check(s) failed."
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------- selftest ---
+
+# Regression test for the failure that made this tool look broken rather than
+# noisy: a helper whose pipeline exits non-zero when it finds NOTHING.
+#
+#     pid=$(ps -ax | grep Claude | awk '{print $1}')
+#
+# With no match grep exits 1, pipefail hands that status to the command
+# substitution, the assignment fails, `set -e` ends the script - exit 1, no
+# output, nothing done, no clue why. Every "which process / which account /
+# how many sessions" helper must instead answer "nothing" as empty output and
+# status 0.
+#
+# So this runs each of them against inputs that cannot match anything, in the
+# same `set -euo pipefail` shell the real commands run in, and fails loudly if
+# any of them returns non-zero or invents output. It launches nothing, reads
+# no transcript and writes nothing.
+selftest_case() { # label expect_empty command...
+    local label="$1" expect="$2" out="" rc=0
+    shift 2
+    out=$("$@") || rc=$?
+    if [ "$rc" != 0 ]; then
+        printf 'FAIL  %-26s exit %s (a no-match must be status 0)\n' "$label" "$rc"
+        return 1
+    fi
+    if [ "$expect" = empty ] && [ -n "$out" ]; then
+        printf 'FAIL  %-26s expected no output, got: %s\n' "$label" "$out"
+        return 1
+    fi
+    printf 'PASS  %-26s %s\n' "$label" "${out:-(empty)}"
+    return 0
+}
+
+cmd_selftest() {
+    local failed=0 nodir saved_bin
+
+    # A user-data directory no instance can be running with, and an executable
+    # path no process can have: both force the "found nothing" path.
+    nodir="$ROOT/.selftest-no-such-profile-$$"
+    saved_bin="$APP_BIN"
+    APP_BIN="/nonexistent/claude-multi-selftest/Claude"
+
+    echo "no-match behaviour (every helper must exit 0 and stay quiet):"
+    selftest_case "claude_pids" empty claude_pids || failed=$((failed + 1))
+    selftest_case "running_dirs" empty running_dirs || failed=$((failed + 1))
+    selftest_case "pid_for_dir" empty pid_for_dir "$nodir" || failed=$((failed + 1))
+    selftest_case "claude_count" any claude_count || failed=$((failed + 1))
+    selftest_case "argv_of(unused pid)" empty argv_of 2147483647 || failed=$((failed + 1))
+    selftest_case "uuid_of(no profile)" empty uuid_of "$nodir" || failed=$((failed + 1))
+    selftest_case "store_stamp(no store)" empty store_stamp "$nodir" || failed=$((failed + 1))
+    selftest_case "count_sessions(none)" any count_sessions "$nodir" || failed=$((failed + 1))
+    selftest_case "email_of(no uuid)" any email_of "" || failed=$((failed + 1))
+    selftest_case "account_of(no profile)" any account_of "$nodir" || failed=$((failed + 1))
+    selftest_case "slug_of" any slug_of "work@example.com" || failed=$((failed + 1))
+
+    # is_running / main_running answer a question; they may return 1, but they
+    # must return it instead of ending the script.
+    if is_running "$nodir"; then :; fi
+    printf 'PASS  %-26s returned without aborting\n' "is_running"
+    if main_running; then :; fi
+    printf 'PASS  %-26s returned without aborting\n' "main_running"
+
+    APP_BIN="$saved_bin"
+
+    # Every AppleScript in this file has to compile. A script that does not is
+    # reported by osascript as exit 1 - the same status a user's "Cancel"
+    # uses - so a typo in one would be read as an answer. These are the very
+    # strings the functions run (see the AppleScript section at the top), so
+    # this list is the whole list. osacompile only compiles: no dialog or
+    # notification is shown and nothing is sent to any application - and no
+    # script here names an application the compiler would have to look up,
+    # except System Events.
+    echo
+    echo "AppleScript (every script this tool runs):"
+    if command -v osacompile >/dev/null 2>&1; then
+        local as_name as_src
+        for as_name in AS_ASK_DIALOG AS_RAISE_PID AS_QUIT_APP AS_NOTIFY AS_LAUNCHER_MISSING; do
+            as_src=${!as_name}
+            if osacompile -o /dev/null -e "$as_src" </dev/null >/dev/null 2>&1; then
+                printf 'PASS  %-26s compiles\n' "$as_name"
+            else
+                printf 'FAIL  %-26s does not compile\n' "$as_name"
+                failed=$((failed + 1))
+            fi
+        done
+        # The launcher stub wraps its script in single quotes.
+        case "$AS_LAUNCHER_MISSING" in
+        *"'"*)
+            printf 'FAIL  %-26s contains a single quote\n' "AS_LAUNCHER_MISSING"
+            failed=$((failed + 1))
+            ;;
+        esac
+    else
+        printf 'SKIP  %-26s osacompile not available\n' "AppleScript"
+    fi
+
+    echo
+    if [ "$failed" -gt 0 ]; then
+        echo "$failed check(s) failed."
+        return 1
+    fi
+    echo "all checks passed."
+}
+
+# ------------------------------------------------------------------- setup ---
+
+# Wait for a sign-in EVENT, not for a sign-in STATE. "Is this profile signed
+# in?" is already true for every reused profile, so testing it would return
+# within milliseconds and setup would quit the window before the user could
+# type anything. Snapshot before launching, then wait for a change - and
+# ignore the first couple of polls, because the app touches its own store on
+# startup. Returns non-zero on timeout.
+wait_for_signin() { # dir before_uuid before_stamp
+    local dir="$1" before_uuid="$2" before_stamp="$3"
+    local waited=0 polls=0 tty=0 now_uuid now_stamp
+    if have_tty; then tty=1; fi
+    while [ "$waited" -lt "$SETUP_SIGNIN_TIMEOUT" ]; do
+        sleep "$SETUP_POLL"
+        waited=$((waited + SETUP_POLL))
+        polls=$((polls + 1))
+        if [ "$polls" -gt "$SETUP_GRACE_POLLS" ]; then
+            now_uuid=$(uuid_of "$dir")
+            now_stamp=$(store_stamp "$dir")
+            if { [ -n "$now_uuid" ] && [ "$now_uuid" != "$before_uuid" ]; } ||
+                { [ -n "$now_stamp" ] && [ "$now_stamp" != "$before_stamp" ]; }; then
+                if [ "$tty" = 1 ]; then printf '\r%-60s\r' ""; fi
+                return 0
+            fi
+        fi
+        if [ "$tty" = 1 ]; then
+            printf '\r  waiting for sign-in ... %s elapsed ' "$(fmt_elapsed "$waited")"
+        elif [ $((waited % 30)) = 0 ]; then
+            echo "  waiting for sign-in ... $(fmt_elapsed "$waited") elapsed"
+        fi
+    done
+    if [ "$tty" = 1 ]; then printf '\r%-60s\r' ""; fi
+    return 1
+}
+
+# One profile, start to finish. Returns 0 done, 1 skipped, 2 abort.
+setup_one() {
+    local name="$1" ans before_uuid before_stamp dir
+    dir="$ROOT/$name" # see the note in create_profile: bash 3.2
+    while :; do
+        if [ ! -d "$dir" ]; then
+            create_profile "$name"
+            echo "  created profile directory: $dir"
+        fi
+        refresh_launcher "$name" "  " || true
+
+        # Already signed in: launching it only to quit it again would be rude
+        # and pointless. Leave it alone.
+        #
+        # The test is the ACCOUNT itself, not profile_signed_in(): that helper
+        # still answers yes on its store-directory fallback when python3 is
+        # broken, and a false yes here skips the sign-in outright instead of
+        # merely repeating a warning. A profile opened once and abandoned at
+        # the sign-in screen - the [r]etry branch at the bottom of this very
+        # loop included - was being declared complete, printing the
+        # self-contradicting "already signed in as -".
+        if [ -n "$(uuid_of "$dir")" ]; then
+            echo "  already signed in as $(account_of "$dir") - nothing to do."
+            return 0
+        fi
+
+        before_uuid=$(uuid_of "$dir")
+        before_stamp=$(store_stamp "$dir")
+
+        if ! quit_all; then
+            echo "  could not stop every Claude instance; sign-in may land in the wrong window."
+        fi
+        echo "  opening '$name' as the only running instance - sign in with $name."
+        launch_profile "$dir"
+
+        if wait_for_signin "$dir" "$before_uuid" "$before_stamp"; then
+            echo "  signed in. closing this window."
+            quit_all || true
+            return 0
+        fi
+
+        echo "  no sign-in detected after $(fmt_elapsed "$SETUP_SIGNIN_TIMEOUT")."
+        if ! have_tty; then
+            echo "  skipping '$name'."
+            quit_all || true
+            return 1
+        fi
+        printf '  [r]etry, [s]kip this account, [a]bort setup? (r/s/a) '
+        read -r ans || ans="a"
+        case "$ans" in
+        r | R) echo "  retrying." ;;
+        s | S)
+            quit_all || true
+            return 1
+            ;;
+        *)
+            quit_all || true
+            return 2
+            ;;
+        esac
+    done
+}
+
+cmd_setup() {
+    local emails=() name line ans rc done_n=0 skipped=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --with-mcp-config)
+            SEED_MCP="yes"
+            SEED_MCP_EXPLICIT=1
+            ;;
+        --no-mcp-config)
+            SEED_MCP="no"
+            SEED_MCP_EXPLICIT=1
+            ;;
+        --allow-inside-claude) ALLOW_INSIDE_CLAUDE=1 ;;
+        -*) die "unknown option: $1  (try: claude-multi help)" ;;
+        *) emails+=("$1") ;;
+        esac
+        shift
+    done
+
+    require_app
+    refuse_inside_claude
+    have_tty || die "setup is interactive - run it in Terminal.app."
+
+    if [ "${#emails[@]}" = 0 ]; then
+        echo "Which accounts do you want to use side by side?"
+        echo "Enter one e-mail per line, empty line when done."
+        echo "  (e.g. work@example.com, then personal@example.com)"
+        while :; do
+            printf '  > '
+            read -r line || line=""
+            [ -n "$line" ] || break
+            emails+=("$line")
+        done
+    fi
+    [ "${#emails[@]}" -gt 0 ] || die "no accounts given"
+    for name in "${emails[@]}"; do check_name "$name"; done
+
+    echo
+    echo "Plan:"
+    for name in "${emails[@]}"; do
+        if [ -d "$ROOT/$name" ]; then
+            echo "  - $name         (profile exists, will be reused)"
+        else
+            echo "  - $name         (new profile + launcher)"
+        fi
+    done
+    echo "  then: sync the session lists once, install the background sync job,"
+    echo "        and open every profile."
+    echo
+    echo "IMPORTANT: this QUITS EVERY Claude Desktop window first, and again"
+    echo "  between accounts. That includes any Claude Code session running in"
+    echo "  the app - work in flight will be interrupted. Save first."
+    echo "  Each account then signs in on its own, alone: macOS hands the"
+    echo "  claude:// callback to the instance that started first, so a new"
+    echo "  profile must be the only one running while it signs in."
+    echo
+    printf 'type "yes" to continue: '
+    read -r ans || ans=""
+    if [ "$ans" != "yes" ]; then
+        echo "cancelled."
+        exit 1
+    fi
+
+    echo
+    echo "Quitting all Claude instances..."
+    if quit_all; then
+        echo "  done."
+    else
+        echo "  warning: something is still running; continuing anyway."
+    fi
+
+    for name in "${emails[@]}"; do
+        echo
+        echo "=== $name"
+        # Ask about the MCP config (and its API keys) again for this profile.
+        # Without this, the answer given for the first account was reused in
+        # silence for every later one - see reset_seed_mcp().
+        reset_seed_mcp
+        rc=0
+        setup_one "$name" || rc=$?
+        case "$rc" in
+        0) done_n=$((done_n + 1)) ;;
+        1)
+            skipped=$((skipped + 1))
+            echo "  skipped."
+            ;;
+        *)
+            echo
+            echo "setup aborted. Finished so far: $done_n. Re-run 'claude-multi setup' any time."
+            exit 1
+            ;;
+        esac
+    done
+
+    echo
+    echo "Syncing session lists..."
+    # Deliberately without --propagate-deletions. A merge-only run cannot lose
+    # a session; the deletion path is opt-in and a first-time wizard is the
+    # last place to switch it on for somebody.
+    if run_sync --apply; then :; else
+        echo "  sync could not run (see above); you can retry with: claude-multi sync --apply"
+    fi
+
+    if sync_job_installed; then
+        echo "background sync job already installed."
+    else
+        echo "Installing the background sync job..."
+        # Same here: the job is installed in the safe default mode.
+        run_sync --install --every 1m || echo "  could not install it; retry with: claude-multi sync --install"
+    fi
+
+    echo
+    echo "Opening every profile..."
+    for name in "${emails[@]}"; do
+        if [ -d "$ROOT/$name" ] && ! is_running "$ROOT/$name"; then
+            launch_profile "$ROOT/$name"
+            sleep 2
+        fi
+    done
+
+    echo
+    cmd_list
+    echo
+    echo "Done: $done_n account(s) set up, $skipped skipped."
+    echo "From now on you can open them all at once - no more sign-ins."
+    echo "Open one any time with:  claude-multi <email>   (or Spotlight: 'Claude - <email>')"
+    echo "Remember: the session list is read at startup, so sessions created in"
+    echo "one window appear in the others after a restart or an account switch."
+    echo "The background job merges; it never removes a session from the other"
+    echo "profiles. Deleting everywhere is opt-in:"
+    echo "  claude-multi sync --apply --propagate-deletions"
+    # A wrapper has to be able to tell "all done" from "nobody signed in".
+    if [ "$skipped" -gt 0 ]; then
+        echo
+        echo "$skipped account(s) were not completed; exiting non-zero."
+        exit 1
+    fi
+}
+
+# -------------------------------------------------------------------- help ---
+
+cmd_help() {
+    cat <<'HELP'
+claude-multi - several Claude Desktop accounts side by side on one Mac,
+               with one shared Claude Code session list.
+
+USAGE
+  claude-multi <email>            open that profile (creates it, after asking)
+  claude-multi open <name>        same, for a profile name that is not an e-mail
+  claude-multi list               profile, running state, account, session count
+  claude-multi setup [email...]   guided first-time setup
+  claude-multi app <email>        (re)generate the launcher only
+  claude-multi remove <email>     delete a profile, with confirmation
+  claude-multi sync [args...]     forward to claude-sessions-sync
+  claude-multi doctor             environment check, including the working
+                                  directory of every running instance
+  claude-multi selftest           internal checks (no-match helpers, and that
+                                  every AppleScript the tool runs compiles)
+  claude-multi help               this text
+
+  An unknown first word is an error, not a new profile: only an address-shaped
+  name opens or creates a profile without 'open'.
+
+OPTIONS (open / setup)
+  --with-mcp-config     copy the MCP config into a new profile
+  --no-mcp-config       do not copy it, do not ask
+  -y, --yes             (open) do not ask before creating the profile
+  --restart             (open) quit this profile's running instance, then open
+                        it again - closing its window does not quit it
+  --allow-inside-claude (setup) run even though this looks like a shell hosted
+                        by Claude Desktop - see the warning below
+
+  With neither --with-mcp-config nor --no-mcp-config you are asked once per
+  new profile, including for each account in a multi-account 'setup'.
+
+SYNC (forwarded to claude-sessions-sync)
+  claude-multi sync                      dry run, writes no session data
+  claude-multi sync --apply              merge now; removes no record or marker
+  claude-multi sync --apply --propagate-deletions
+                                         merge AND apply deletions (opt-in;
+                                         without --apply it is a dry run too)
+  claude-multi sync --no-delete          deprecated no-op: that is the default
+  claude-multi sync --install --every 1m install the background job
+  claude-multi sync --uninstall          remove it
+  claude-multi sync --status             interval, deletion mode, run count, log
+  claude-multi sync --restore-list       list the automatic backups
+  claude-multi sync --restore <stamp>    copy one backup back into the stores
+
+  Deletions do NOT propagate unless you ask for them. A plain run merges the
+  session lists and never removes a record, so deleting a session in one
+  account leaves it in the others until you run
+  'claude-multi sync --apply --propagate-deletions'.
+  'setup' installs the background job in that same safe default mode.
+
+EXAMPLE
+  claude-multi setup work@example.com personal@example.com
+  claude-multi list
+  claude-multi work@example.com
+
+WHAT IS SEPARATE, WHAT IS SHARED
+  separate : login, cookies, session-list store, app preferences
+  shared   : ~/.claude - transcripts, memory, skills, agents, CLAUDE.md
+  asked    : claude_desktop_config.json (your MCP servers, and whatever API
+             keys their env blocks hold) is copied into a new profile only if
+             you say so - never silently, and the question is put again for
+             every new profile
+
+PATHS
+  profiles   ~/.claude-profiles/<email>            (0700, private to you)
+  launchers  /Applications/Claude - <email>.app    (or ~/Applications, or
+             $CLAUDE_MULTI_LAUNCHER_DIR)
+  accounts   ~/.claude-profiles/accounts.tsv       (0600; delete it to reset
+             the uuid -> address labels)
+
+  Launcher names contain the account address and are visible to anyone who can
+  see that folder or your Spotlight results. Set CLAUDE_MULTI_LAUNCHER_DIR to
+  ~/Applications on a shared or screen-shared Mac.
+
+GOOD TO KNOW
+  A new profile must be the only running Claude instance while it signs in -
+  macOS delivers the claude:// callback to whichever instance started first.
+  'setup' handles that for you; it is a one-time cost per profile.
+
+  'setup' quits every Claude Desktop window, repeatedly. Run it from
+  Terminal.app, never from a Claude Code session hosted by Claude Desktop:
+  that would kill the session running it. It exits non-zero when at least one
+  account was not completed.
+
+  Closing a profile's window does not quit its Claude instance: the process
+  stays alive with nothing on screen. Opening that profile again raises the
+  instance and offers to restart it; 'claude-multi open <name> --restart'
+  skips the question.
+
+  Started from the Dock, Spotlight or a launcher there is no terminal, so
+  'open' asks its questions in a dialog. Exit status, terminal or dialog
+  alike: declining to create a profile, or declining the sign-in warning,
+  exits 1. Declining to restart a profile that is already running exits 0 -
+  it was brought to the front, so the open itself was done. A dialog that
+  could not be shown at all exits 2, after a notification and a line on
+  stderr - a breakage never passes for a "no". A dialog nobody answers times
+  out and is treated as no, never as a click.
+
+  Every instance this tool starts - open, --restart, setup - runs with its
+  working directory set to / and stdin from /dev/null, whatever directory you
+  ran the command in. An instance started from a folder macOS protects
+  (~/Documents, ~/Desktop, ~/Downloads) would otherwise hand that directory to
+  its MCP servers, which then fail with EPERM / uv_cwd. 'doctor' reports any
+  running instance whose working directory is not /.
+
+  Claude Desktop reads the session list only at startup and on account switch,
+  so synced sessions appear after a restart, not live.
+HELP
+}
+
+# ---------------------------------------------------------------- dispatch ---
+
+cmd="${1:-}"
+case "$cmd" in
+"" | help | -h | --help)
+    cmd_help
+    ;;
+list | --list)
+    shift
+    [ $# -eq 0 ] || die "list takes no arguments"
+    cmd_list
+    ;;
+setup)
+    shift
+    cmd_setup "$@"
+    ;;
+app | --app)
+    shift
+    cmd_app "$@"
+    ;;
+open)
+    shift
+    cmd_open "$@"
+    ;;
+remove | --remove)
+    shift
+    cmd_remove "$@"
+    ;;
+sync)
+    shift
+    cmd_sync "$@"
+    ;;
+doctor | --doctor)
+    shift
+    [ $# -eq 0 ] || die "doctor takes no arguments"
+    cmd_doctor
+    ;;
+selftest | --selftest)
+    shift
+    [ $# -eq 0 ] || die "selftest takes no arguments"
+    cmd_selftest
+    ;;
+-*)
+    die "unknown option: $cmd  (try: claude-multi help)"
+    ;;
+*)
+    # Only an address-shaped word may fall through to open/create. Anything
+    # else is far likelier to be a mistyped subcommand ('lst', 'sycn') than a
+    # profile the user wants created, and creating one launches a new signed-out
+    # Claude instance and writes a launcher into /Applications.
+    if is_email_shaped "$cmd"; then
+        cmd_open "$@"
+    else
+        die "unknown command: $cmd
+       try:  claude-multi help
+       to open or create a profile with that name:  claude-multi open $cmd"
+    fi
+    ;;
+esac

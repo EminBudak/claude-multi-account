@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Python
+*.py[cod]
+__pycache__/
+.venv/
+venv/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local state: never commit anything that identifies an account or a machine.
+# accounts.tsv maps account UUIDs to e-mail addresses and lives in
+# ~/.claude-profiles; a stray copy here would leak real addresses.
+accounts.tsv
+*.local
+.env
+.env.*
+
+# Logs, backups, generated launchers and profile data
+*.log
+logs/
+backups/
+profiles/
+.claude-profiles/
+*.plist
+*.app/

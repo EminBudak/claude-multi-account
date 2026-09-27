@@ -2510,8 +2510,14 @@ def install(interval, do_delete):
         # Also fire on account switch: the app rewrites config.json then.
         "WatchPaths": [os.path.join(APP, "config.json")],
         "RunAtLoad": True,
-        "ProcessType": "Background",
-        "LowPriorityIO": True,
+        # NOT "Background" + LowPriorityIO. Under real load (a VM, a browser
+        # and several Claude instances at once) macOS throttles a Background
+        # job's disk I/O almost to zero: measured, a single run that takes
+        # ~4s in the foreground ran for minutes, and no run completed for
+        # ~50 minutes - so nothing synced at all. The job is tiny (a few
+        # hundred small files a minute), so standard priority costs nothing.
+        "ProcessType": "Standard",
+        "LowPriorityIO": False,
         # A file of its own: launchd holds this open and appends to it, so it
         # must not be the log this script rewrites when it trims.
         "StandardErrorPath": ERRLOG,

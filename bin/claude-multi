@@ -937,22 +937,27 @@ create_profile() {
 #                ~/Downloads - folders macOS guards with TCC - node's getcwd()
 #                fails with EPERM (syscall uv_cwd) in each MCP server, and
 #                every one of them dies at startup. An instance started by
-#                LaunchServices (Dock, Finder) runs in "/", so that is what is
-#                used here too. `doctor` reports any instance that does not.
-#   stdin        from /dev/null. A detached instance that inherits the
-#                caller's stdin holds that pipe open for as long as it runs,
-#                so a terminal wrapper or an agent's tool call waiting for
-#                this command never sees it return. stdout and stderr go to
-#                /dev/null for the same reason.
+#                LaunchServices (Dock, Finder) runs in "/". `doctor` reports
+#                any instance that does not.
+#   stdio        not inherited. An instance that inherits the caller's stdin
+#                holds that pipe open for as long as it runs, so a terminal
+#                wrapper or an agent's tool call waiting for this command
+#                never sees it return.
+#   own group    parent launchd, a process group of its own. An instance
+#                exec'd from a shell stays in that shell's process group, and
+#                stopping the shell's job - closing a terminal tab, or an
+#                agent harness killing a background task - kills Claude with
+#                it (nohup only ignores SIGHUP). Observed: stopping two stale
+#                background tasks took two signed-in profiles down with them.
 #
-# The subshell exits as soon as the instance is started, so the instance is
-# nobody's job and is reparented to launchd; there is nothing to `disown`.
+# All three come for free by asking LaunchServices to start the instance,
+# exactly as the Dock does, instead of exec'ing the binary from this shell.
+# -n forces a new instance of the same bundle; everything after --args
+# reaches Claude. `open` returns as soon as LaunchServices has the request.
 launch_profile() {
     local dir="$1"
-    (
-        cd / || exit 1
-        nohup "$APP_BIN" --user-data-dir="$dir" </dev/null >/dev/null 2>&1 &
-    )
+    open -n -a "$APP_BUNDLE" --args --user-data-dir="$dir" >/dev/null 2>&1 ||
+        die "could not start Claude Desktop through LaunchServices (open -n -a $APP_BUNDLE)"
 }
 
 # Signed in = the profile knows which account it holds.

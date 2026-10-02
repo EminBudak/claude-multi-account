@@ -79,6 +79,8 @@ SETUP_POLL=2             # seconds between sign-in checks
 SETUP_GRACE_POLLS=2      # polls to ignore before believing a sign-in happened
 QUIT_TIMEOUT=20          # seconds to wait for instances to quit on their own
 DIALOG_TIMEOUT=120       # seconds before an unanswered dialog counts as "no"
+SYNC_LOCK_WAIT=20        # seconds a sync started here waits for one already running
+PRE_OPEN_SYNC_TIMEOUT=25 # seconds `open` waits for its own sync before launching
 
 # Runtime switches (see the flag parsing in cmd_open / cmd_setup).
 SEED_MCP="ask"           # ask | yes | no  - copy the MCP config into a profile?
@@ -192,6 +194,43 @@ check_name() {
 }
 
 is_email_shaped() { case "$1" in *@*.*) return 0 ;; *) return 1 ;; esac; }
+
+# The spelling an existing profile directory actually has on disk.
+#
+# The default APFS volume is case-insensitive: Work@Example.com and
+# work@example.com name the same directory. But "is it running?" is answered
+# by comparing the profile path, as a string, with the --user-data-dir of the
+# running instances - so a name typed in another letter case found the
+# directory, did not find its instance, and went on to start a second
+# instance on the same data (and `remove` got past its "is running" refusal).
+# Every command therefore swaps the name it was given for the directory
+# entry's own spelling right after check_name, so the running checks, the
+# launcher and the profile directory all agree on one string.
+#
+# An exact match wins, so on a case-sensitive volume two profiles that differ
+# only in case stay two profiles. A name with no directory yet comes back
+# unchanged.
+canonical_name() { # name
+    local name="$1" d base want hit=""
+    if [ ! -d "$ROOT/$name" ]; then
+        printf '%s\n' "$name"
+        return 0
+    fi
+    want=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+    for d in "$ROOT"/*/; do
+        [ -d "$d" ] || continue
+        d="${d%/}"
+        base="${d##*/}"
+        if [ "$base" = "$name" ]; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+        if [ -z "$hit" ] && [ "$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')" = "$want" ]; then
+            hit="$base"
+        fi
+    done
+    printf '%s\n' "${hit:-$name}"
+}
 
 # Not an error - just a nudge, because `list` is far more readable when the
 # profile name is the account it holds.
@@ -1049,6 +1088,7 @@ cmd_open() {
         shift
     done
     check_name "$name"
+    name=$(canonical_name "$name")
     require_app
 
     dir="$ROOT/$name"
@@ -1114,11 +1154,33 @@ cmd_open() {
 
     if [ "$created" = 1 ]; then create_profile "$name"; fi
 
+    # Sync right before the instance starts - see pre_open_sync(). Skipped for
+    # a profile created just now: it has no store until its first sign-in.
+    # `|| true`: whatever happens in there, the profile still opens and the
+    # exit status is not its business.
+    if [ "$created" != 1 ]; then
+        pre_open_sync || true
+    fi
+
     launch_profile "$dir"
 
     if [ "$created" = 1 ]; then
         echo "created profile '$name', opening it."
         echo "Sign in with $name on the screen that appears."
+        echo "After the first sign-in the window lists no sessions: Claude creates the"
+        echo "profile's session store only at sign-in, and reads the list only when it"
+        if sync_job_installed; then
+            echo "starts. Once you have signed in, restart the profile once (it syncs first):"
+            echo "    claude-multi open $name --restart"
+        else
+            echo "starts. The background sync job is not installed (or not loaded), so"
+            echo "nothing syncs on its own: once you have signed in, sync first and then"
+            echo "restart the profile:"
+            echo "    claude-multi sync --apply"
+            echo "    claude-multi open $name --restart"
+            echo "(or install the job with 'claude-multi sync --install'; a restart then"
+            echo "syncs first by itself)"
+        fi
         if [ "$SEEDED_MCP" = 1 ]; then
             echo "MCP settings were copied from the main profile; memory, skills and"
             echo "transcripts were already shared."
@@ -1170,6 +1232,7 @@ cmd_app() {
     local name="${1:-}" app
     [ $# -le 1 ] || die "app takes one profile name"
     check_name "$name"
+    name=$(canonical_name "$name")
     hint_if_not_email "$name"
     # Always regenerate: this is the command people run to repair a launcher,
     # so it must not quietly decide there is nothing to do. Assign first -
@@ -1191,6 +1254,7 @@ cmd_remove() {
     local name="${1:-}" dir size ans app
     [ $# -le 1 ] || die "remove takes one profile name"
     check_name "$name"
+    name=$(canonical_name "$name")
     dir="$ROOT/$name"
     [ -d "$dir" ] || die "no such profile: $name"
     if is_running "$dir"; then
@@ -1263,6 +1327,64 @@ cmd_sync() {
 sync_job_installed() {
     [ -f "$LAUNCHD_PLIST" ] || return 1
     launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1
+}
+
+# Wait for a background child until $SECONDS reaches `deadline`. Returns the
+# child's own exit status, or 124 when it is still running at the deadline -
+# it is then left alone, not killed.
+wait_until() { # pid deadline
+    local pid="$1" deadline="$2" rc=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$SECONDS" -ge "$deadline" ]; then return 124; fi
+        sleep 0.2
+    done
+    wait "$pid" 2>/dev/null || rc=$?
+    return "$rc"
+}
+
+# The sync `open` runs right before it starts an instance. Claude Desktop
+# reads the session list only when it starts, and the profile is not running
+# at this point, so this is the one moment a sync is certain to be picked up -
+# without it the profile opens on whatever the background job last wrote, up
+# to one interval out of date.
+#   - only when the background job is installed AND loaded: that is how the
+#     user opted in to syncing; opening a profile must not start syncing
+#     stores for someone who only wanted separate windows
+#   - default mode, so it can add and update but never delete - whatever mode
+#     the installed job runs in
+#   - --wait: if the job is mid-run, wait for it rather than skip
+#   - bounded: the question to launchd and the sync together get
+#     PRE_OPEN_SYNC_TIMEOUT seconds. Past that the profile is opened anyway
+#     and the sync is left to finish on its own - it is not killed, and its
+#     writes are atomic. Both run in the background with no stdin and no
+#     output, so neither can hold the caller's terminal or pipe open, and
+#     the sync ignores SIGHUP, so this command returning (and its terminal
+#     session ending with it) does not take the sync down half way.
+#   - one line on a terminal before it, so a wait is never silent
+#   - never a reason not to open the profile: always returns 0, and the
+#     caller adds `|| true` on top
+# It does nothing for a profile the sync currently skips as idle (see the
+# README): that one is taken back in only by a sync that runs after the app
+# has written to it, i.e. after this start.
+pre_open_sync() {
+    local deadline pid rc=0
+    deadline=$((SECONDS + PRE_OPEN_SYNC_TIMEOUT))
+    [ -f "$LAUNCHD_PLIST" ] || return 0
+    (sync_job_installed) </dev/null >/dev/null 2>&1 &
+    pid=$!
+    wait_until "$pid" "$deadline" || rc=$?
+    [ "$rc" = 0 ] || return 0
+    if [ -t 1 ]; then echo "syncing the session lists first ..."; fi
+    (
+        trap '' HUP
+        run_sync --apply --quiet --wait "$SYNC_LOCK_WAIT"
+    ) </dev/null >/dev/null 2>&1 &
+    pid=$!
+    wait_until "$pid" "$deadline" || rc=$?
+    if [ "$rc" = 124 ] && [ -t 1 ]; then
+        echo "  still syncing after ${PRE_OPEN_SYNC_TIMEOUT}s - opening the profile now; the sync finishes on its own."
+    fi
+    return 0
 }
 
 # ------------------------------------------------------------------ doctor ---
@@ -1657,7 +1779,7 @@ setup_one() {
 }
 
 cmd_setup() {
-    local emails=() name line ans rc done_n=0 skipped=0
+    local emails=() name line ans rc done_n=0 skipped=0 i
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1692,7 +1814,10 @@ cmd_setup() {
         done
     fi
     [ "${#emails[@]}" -gt 0 ] || die "no accounts given"
-    for name in "${emails[@]}"; do check_name "$name"; done
+    for i in "${!emails[@]}"; do
+        check_name "${emails[$i]}"
+        emails[$i]=$(canonical_name "${emails[$i]}")
+    done
 
     echo
     echo "Plan:"
@@ -1755,8 +1880,11 @@ cmd_setup() {
     echo "Syncing session lists..."
     # Deliberately without --propagate-deletions. A merge-only run cannot lose
     # a session; the deletion path is opt-in and a first-time wizard is the
-    # last place to switch it on for somebody.
-    if run_sync --apply; then :; else
+    # last place to switch it on for somebody. --wait: when setup is re-run to
+    # add an account, the background job may be mid-run; without it this sync
+    # would be skipped ("another run is already in progress", exit 0) and the
+    # profiles below would open on a list one run out of date.
+    if run_sync --apply --wait "$SYNC_LOCK_WAIT"; then :; else
         echo "  sync could not run (see above); you can retry with: claude-multi sync --apply"
     fi
 
@@ -1842,6 +1970,9 @@ SYNC (forwarded to claude-sessions-sync)
   claude-multi sync --install --every 1m install the background job
   claude-multi sync --uninstall          remove it
   claude-multi sync --status             interval, deletion mode, run count, log
+  claude-multi sync --apply --wait 20    wait up to 20 s for a sync that is
+                                         already running instead of skipping
+                                         (any run that takes the lock; max 300)
   claude-multi sync --restore-list       list the automatic backups
   claude-multi sync --restore <stamp>    copy one backup back into the stores
 
@@ -1908,6 +2039,24 @@ GOOD TO KNOW
 
   Claude Desktop reads the session list only at startup and on account switch,
   so synced sessions appear after a restart, not live.
+
+  That is why 'open' syncs first: when the background sync job is installed
+  and loaded, and the profile already existed, one merge-only sync runs right
+  before the instance starts (it never deletes, whatever mode the job runs
+  in). It waits up to 20 s for a sync already in progress and is given 25 s in
+  all; after that the profile opens anyway and the sync finishes on its own.
+  On a terminal it says so in one line first. Without the job, 'open' does
+  not sync. A profile the sync currently skips as idle is not helped by it.
+
+  The window a new profile signs in with lists no sessions: its session store
+  exists only after the sign-in, and the list is read at startup. Restart the
+  profile once afterwards ('claude-multi open <name> --restart') - with the
+  job installed that syncs first; without it, run 'claude-multi sync --apply'
+  before restarting.
+
+  On the default, case-insensitive macOS volume a name that differs from an
+  existing profile only in letter case is that profile: every command uses
+  the spelling the profile directory already has.
 HELP
 }
 

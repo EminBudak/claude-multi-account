@@ -36,6 +36,10 @@ step() { printf '%s==>%s %s\n' "$B" "$R" "$*"; }
 note() { printf '    %s%s%s\n' "$DIM" "$*" "$R"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+# A path quoted for the shell. The commands printed below are meant to be
+# pasted, and a checkout in a directory with a space in its name would
+# otherwise print one that splits in two.
+q()    { printf '%q' "$1"; }
 
 usage() {
     cat <<'USAGE'
@@ -149,7 +153,7 @@ EOF
     # The full path, not the bare command: the symlinks were removed a few
     # lines ago, so `claude-sessions-sync` is no longer on the PATH and the
     # bare name would fail for exactly the person following this instruction.
-    say "    $SRC_DIR/claude-sessions-sync --uninstall  # the background job ($SYNC_LABEL)"
+    say "    $(q "$SRC_DIR/claude-sessions-sync") --uninstall  # the background job ($SYNC_LABEL)"
     # Kept line for line identical to the README's undo block. The launcher
     # lines cover every place claude-multi can have written one: /Applications,
     # ~/Applications when /Applications was not writable, and wherever
@@ -174,7 +178,7 @@ UNDO
     say "  Before removing ~/.claude-profiles: each profile keeps its own copy of the"
     say "  session list. If the sync has been running, those entries are in your"
     say "  main profile too. If a profile was never synced, its sidebar entries go"
-    say "  with it. Run: $SRC_DIR/claude-sessions-sync --apply   first if unsure."
+    say "  with it. Run: $(q "$SRC_DIR/claude-sessions-sync") --apply   first if unsure."
     exit 0
 fi
 
@@ -308,4 +312,4 @@ note "to whichever instance started first. One-time cost per profile."
 note "Your MCP config (and any API keys in it) is copied into a new profile"
 note "only if you ask: claude-multi asks once per profile, and defaults to no."
 say ""
-say "Uninstall later with: $REPO/install.sh --uninstall"
+say "Uninstall later with: $(q "$REPO/install.sh") --uninstall"

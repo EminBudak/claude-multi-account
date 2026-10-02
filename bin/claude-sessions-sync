@@ -80,6 +80,10 @@ WHEN IN DOUBT, NOTHING HAPPENS
         skipped -- as a source and as a destination. An unreadable destination
         is never overwritten and never unlinked, so an older copy can never
         clobber the newest one and a file nobody could read is never deleted.
+        A record holding a number that is not finite -- NaN, Infinity, or a
+        literal such as 1e999 that overflows to one -- is unreadable in the
+        same sense: a copy of it would not be JSON, and the app could not
+        parse it. Nothing this tool writes contains such a token.
       * a deletion marker that exists but whose content is not a plausible
         millisecond timestamp (empty, truncated mid-write, garbage) is treated
         as unknown-but-present. The session is left completely alone for that
@@ -181,6 +185,7 @@ USAGE
     claude-sessions-sync --install [--every 1m]   install the background job
     claude-sessions-sync --uninstall          remove the background job
     claude-sessions-sync --status             interval, deletion mode, recent log
+    claude-sessions-sync --apply --wait 20    wait for a running sync instead of skipping
     claude-sessions-sync --restore-list       list available backups
     claude-sessions-sync --restore <stamp>    copy a backup back into the stores
 
@@ -307,6 +312,12 @@ DIR_MODE = 0o700
 FILE_MODE = 0o600
 
 QUIET = False
+# --wait: how long to wait for a sync that is already running before giving up.
+# 0 keeps the historical behaviour (give up at once). bin/claude-multi passes a
+# few seconds when it syncs right before opening a profile: skipping that sync
+# because the background job happened to be mid-run would open the profile on
+# a list that is one run out of date.
+LOCK_WAIT = 0.0
 
 UNITS = {"S": 1, "M": 60, "H": 3600, "D": 86400}
 
@@ -469,9 +480,21 @@ class Lock:
         os.makedirs(LOGDIR, exist_ok=True)
         chmod_quiet(LOGDIR, DIR_MODE)
         fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, FILE_MODE)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        # Monotonic, not the wall clock: a clock stepped backwards during the
+        # wait would stretch it past the cap, a forward step would cut it short.
+        deadline = time.monotonic() + max(0.0, LOCK_WAIT)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.monotonic() < deadline:
+                    time.sleep(0.2)
+                    continue
+                locked = False
+                break
+        if not locked:
             other = ""
             try:
                 other = os.read(fd, 32).decode("utf-8", "ignore").strip()
@@ -517,31 +540,133 @@ class Lock:
 
 _ACTIVE_STORE_CACHE = ()  # () = not computed yet, (value,) = computed
 
+# The main app's config.json is a few kilobytes. The cap only bounds what is
+# read when something else sits at that path; a file larger than this is not
+# parsed at all.
+CONFIG_MAX_BYTES = 4 * 1024 * 1024
+# An initialization line in the desktop app's main.log. The org id is anchored
+# at its end: a longer token ("<id>/../x", "<id>.old", "<id>_2") must not be
+# accepted by its hexadecimal prefix. A full stop that merely ends the
+# sentence does not count as part of the token.
+INIT_LINE_RE = re.compile(
+    r"Initialization succeeded.*?accountId=([0-9a-fA-F-]+),\s*"
+    r"orgId=([0-9a-fA-F-]+)(?![0-9A-Za-z_/-]|\.[0-9A-Za-z_./-])")
+# Every main.log line starts with a local-time stamp.
+LOG_STAMP_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)")
+# How old the main account's newest initialization line has to be before the
+# store it names is adopted. See active_store().
+ACTIVE_MIN_AGE = 10
+
+
+def main_account():
+    """The account the MAIN app (the default user-data directory) is signed in
+    to, from its own config.json, lower-cased; None when it cannot be read.
+
+    Read through read_regular(): a fifo at that path must not stall the run
+    while it holds the lock. A symlinked config.json is followed -- the file
+    is only ever read."""
+    try:
+        raw = read_regular(os.path.join(APP, "config.json"),
+                           CONFIG_MAX_BYTES + 1, follow=True)
+        if raw is None or len(raw) > CONFIG_MAX_BYTES:
+            return None
+        v = json.loads(raw.decode("utf-8")).get("lastKnownAccountUuid")
+        if isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F-]{8,64}", v):
+            return v.lower()
+    except Exception:
+        pass
+    return None
+
+
+def log_stamp(line):
+    """Seconds since the epoch for the local-time stamp a main.log line starts
+    with, or None when the line has no stamp that can be read as a real local
+    time. In the hour a clock is set back the same stamp names two moments;
+    the later one is returned, so such a line can only look younger than it
+    is, never older."""
+    m = LOG_STAMP_RE.match(line)
+    if not m:
+        return None
+    want = tuple(int(g) for g in m.groups())
+    best = None
+    for dst in (0, 1):
+        try:
+            t = time.mktime(want + (0, 0, dst))
+            back = tuple(time.localtime(t)[:6])
+        except (ValueError, OverflowError, OSError):
+            continue
+        if back == want and (best is None or t > best):
+            best = t
+    return best
+
 
 def active_store():
-    """The <accountUuid>/<orgUuid> directory the app is using right now, taken
-    from the last initialization line in the desktop app's main.log.
+    """The <accountUuid>/<orgUuid> directory the MAIN app is using right now.
+
+    It exists for one case: a main app freshly signed in to an account whose
+    store is still empty, which the "has records" rule would never pick up.
+    (Profiles do not need it; their stores are found by listing, empty or not.)
+    A store that holds records is discovered without it, so every doubt here
+    is resolved by adopting nothing: the cost is a short delay before a fresh
+    store is first filled, never a missed session.
+
+    The org comes from the desktop app's main.log, and that log is SHARED:
+    every instance started with --user-data-dir appends to the same file. So
+    the last initialization line is not necessarily the main app's, and during
+    an account switch the app logs a transient line pairing one account with
+    the other account's org, a couple of seconds before the line for the pair
+    it settles on. Trusting the last line blindly mapped a profile's account,
+    or that transient pair, onto an empty directory under the main tree and
+    filled it with a copy of every session that no account ever reads.
+
+    So the candidate is the NEWEST initialization line for the account named
+    in the main app's own config.json, and it is adopted only when both hold:
+
+      * it is at least ACTIVE_MIN_AGE seconds old, by its own time stamp. The
+        background job is started by the very config.json rewrite that
+        accompanies a switch, i.e. inside the window in which the transient
+        line can be the newest one. A line whose stamp cannot be read, or
+        lies in the future, is not trusted;
+      * no line for a DIFFERENT account names the same org after it. That is
+        what the settled line does to a transient one: the org turned out to
+        belong to the other account.
+
+    When either fails nothing is adopted -- there is no falling back to an
+    older line. No readable account, or no line for it, means no active store
+    either: nothing is guessed. What this cannot tell apart is a transient
+    line that stays the account's newest for longer than that with no later
+    claim on its org; the log then reads exactly like a completed sign-in.
 
     main.log routinely reaches tens of megabytes and this job runs every
     minute, so only the tail is read, and the answer is computed once per
-    process."""
+    process. It is read through read_regular(), like config.json, so a fifo
+    at that path cannot stall the run."""
     global _ACTIVE_STORE_CACHE
     if _ACTIVE_STORE_CACHE:
         return _ACTIVE_STORE_CACHE[0]
     found = None
+    acct = main_account()
     try:
-        with open(MAIN_LOG, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - MAIN_LOG_TAIL_BYTES))
-            tail = fh.read().decode("utf-8", "ignore").splitlines()
-        for line in reversed(tail):
-            m = re.search(
-                r"Initialization succeeded.*?accountId=([0-9a-fA-F-]+),\s*orgId=([0-9a-fA-F-]+)",
-                line)
-            if m:
-                p = os.path.join(BASE, m.group(1), m.group(2))
-                found = p if os.path.isdir(p) else None
+        raw = None
+        if acct:
+            raw = read_regular(MAIN_LOG, MAIN_LOG_TAIL_BYTES, follow=True,
+                               tail=True)
+        if raw is not None:
+            claimed = set()  # orgs named by a later line for another account
+            for line in reversed(raw.decode("utf-8", "ignore").splitlines()):
+                m = INIT_LINE_RE.search(line)
+                if not m:
+                    continue
+                if m.group(1).lower() != acct:
+                    claimed.add(m.group(2).lower())
+                    continue
+                stamp = log_stamp(line)
+                if (stamp is not None
+                        and time.time() - stamp >= ACTIVE_MIN_AGE
+                        and m.group(2).lower() not in claimed):
+                    p = os.path.join(BASE, m.group(1), m.group(2))
+                    if os.path.isdir(p):
+                        found = p
                 break
     except Exception:
         found = None
@@ -579,8 +704,8 @@ def is_snapshot_name(name):
     into the sync -- and into the global deletion maximum.
 
     In a name holding an address, a parked word that is merely a label of the
-    DOMAIN does not count: me@mail.archive.org and dev@team.snapshot.dev are
-    live profiles. The word counts when a complete address comes before it
+    DOMAIN does not count: me@mail.archive.example and dev@team.snapshot.example
+    are live profiles. The word counts when a complete address comes before it
     (work@example.com.old), or when what follows it is not the rest of a
     domain (me@mail.bak-2026, or a later label that is itself a parked word).
     In doubt it stays a parked copy: skipping a live profile is reported,
@@ -886,23 +1011,38 @@ def stores():
                     # discovered is the safe direction, but say so. (The
                     # active store is appended below whatever happens here,
                     # and scan() reports it.)
-                    if op != active_store():
+                    if not same_dir(op, active_store()):
                         warn_once("store:" + op, "WARNING %s cannot be listed, "
                                   "so it is not synced this run" % op)
                     continue
                 if is_profile or any(store_contents(op)):
                     out.append(op)
+    # By identity, not by spelling: the active store's path is built from the
+    # log's own spelling of the two ids, and on a case-insensitive volume
+    # another letter case names the very directory that was listed above.
+    # Compared as strings, that one store was in the run twice.
     act = active_store()
-    if act and act not in out:
+    if act and not any(same_dir(act, p) for p in out):
         out.append(act)
     return out
+
+
+def same_dir(a, b):
+    """True when both paths name the same directory entry on disk (device and
+    inode), however each is spelled. False when either is missing or None."""
+    if not a or not b:
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------
 # reading index files
 # --------------------------------------------------------------------------
 
-def read_regular(path, limit=-1):
+def read_regular(path, limit=-1, follow=False, tail=False):
     """The bytes of `path` when it is a plain regular file, else None.
 
     Index files live in directories other programs write to, so the name
@@ -913,15 +1053,25 @@ def read_regular(path, limit=-1):
     outside the store. So: O_NOFOLLOW (a symlink fails to open), O_NONBLOCK
     (a fifo opens at once instead of waiting for a writer), and fstat on the
     descriptor that was actually opened, which must be a regular file.
+
+    The two options are for the app's own config.json and main.log, which are
+    only ever read and are not index files. `follow` leaves O_NOFOLLOW out, so
+    a symlinked one keeps working -- what it leads to must still be a regular
+    file. `tail` returns the LAST `limit` bytes instead of the first.
     """
-    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if not follow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
     except OSError:
         return None
     try:
-        if not stat_mod.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
             return None
+        if tail and limit > 0:
+            os.lseek(fd, max(0, st.st_size - limit), os.SEEK_SET)
         chunks, left = [], limit
         while left != 0:
             chunk = os.read(fd, 65536 if left < 0 else min(left, 65536))
@@ -952,17 +1102,40 @@ def load_record(path):
     treat it as a record with no fields. A record caught mid-write fails to
     parse, a file holding a valid JSON non-object (null, a list, a number)
     would raise later on .get(), and an entry that is not a regular file (see
-    read_regular) cannot be a record -- all of them land here."""
+    read_regular) cannot be a record -- all of them land here.
+
+    So does a record holding a number that is not finite: a bare NaN or
+    Infinity, or a literal such as 1e999 that overflows to one. Python reads
+    those and would write them back out as NaN / Infinity, which is not JSON
+    -- the app's parser rejects the whole file -- so copying such a record
+    would replace a destination the app can read with one it cannot. The app
+    never writes one; a file that holds one is treated like any other record
+    that cannot be read."""
     raw = read_regular(path)
     if raw is None:
         return None
     try:
-        d = json.loads(raw)
+        d = json.loads(raw, parse_float=_finite_float,
+                       parse_constant=_not_json)
     except Exception:
         return None
     if not isinstance(d, dict):
         return None
     return d
+
+
+def _finite_float(text):
+    """json parse_float hook: a float, or ValueError when the literal
+    overflows to an infinity."""
+    v = float(text)
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ValueError("number is not finite: %s" % text)
+    return v
+
+
+def _not_json(name):
+    """json parse_constant hook: NaN, Infinity and -Infinity are not JSON."""
+    raise ValueError("not a JSON value: %s" % name)
 
 
 def names_other_session(rec, sid):
@@ -2192,7 +2365,6 @@ def sync(apply_, do_delete):
         # record), so no file in it is required.
         require.setdefault(os.path.dirname(mk), set())
     act = active_store()
-    act_real = os.path.realpath(act) if act else None
     destructive = bool(removes or marks or stale)
     first_apply = not backup_dirs()
 
@@ -2213,7 +2385,7 @@ def sync(apply_, do_delete):
         print("stores (%d):" % len(paths))
         for p in paths:
             flag = ""
-            if act_real and os.path.realpath(p) == act_real:
+            if same_dir(p, act):
                 flag = "  <- the store the app is using now"
             print("   %3d  %-22s%s" % (record_count(p), label(p), flag))
         print("\nunique sessions       : %d" % len(recs))
@@ -2353,8 +2525,12 @@ def sync(apply_, do_delete):
         try:
             # UTF-8 whatever the locale: under a Latin-1 locale the default
             # encoding wrote bytes nothing can read back as JSON.
+            # allow_nan=False: never emit a bare NaN / Infinity, which is not
+            # JSON. load_record() already refuses a record holding one; this
+            # is the backstop -- the write fails and is reported, instead of
+            # leaving a file the app cannot parse.
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(rec, fh, ensure_ascii=False)
+                json.dump(rec, fh, ensure_ascii=False, allow_nan=False)
                 fh.flush()
                 os.fsync(fh.fileno())
             try:
@@ -2640,6 +2816,9 @@ deletion mode:   OPT-IN, and OFF unless you pass --propagate-deletions.
 unreadable file: a record or marker caught half-written is skipped for that run
                  rather than guessed at, so a damaged file neither deletes a
                  session nor brings a deleted one back; the dry run lists them.
+                 A record holding a number that is not finite (NaN, Infinity,
+                 or a literal like 1e999 that overflows) counts as unreadable
+                 too: it is not copied, and no such token is ever written.
                  A record whose sessionId field contradicts its own file name,
                  whose lastActivityAt is not a plausible millisecond value
                  (before 2001, or more than a day ahead of this machine's
@@ -2663,6 +2842,21 @@ profiles:        an extra profile under ~/.claude-profiles counts as a live
                  not count. Anything else is a snapshot: not read, not
                  written, and its markers are ignored. The run names it once,
                  with the remedy
+main app:        a store that holds records or markers is found by listing.
+                 A main app freshly signed in to an account has an EMPTY
+                 store, which is found through two files that are only read:
+                 the app's own config.json (which account it is signed in to)
+                 and the last 256 KB of its main.log (that account's newest
+                 initialization line, which names the org). That store is
+                 adopted only when the line is at least 10 seconds old by its
+                 own time stamp and no later line for another account names
+                 the same org -- during an account switch the app briefly
+                 logs a pair it does not keep. Otherwise nothing is guessed,
+                 and a later run decides
+--wait SECONDS:  applies to every run that takes the lock (the dry run,
+                 --apply, --restore): wait that long for a run already in
+                 progress instead of exiting at once. Capped at 300; ignored
+                 by --status, --install, --uninstall and --restore-list
 backups:         taken automatically before anything is deleted and before the
                  first apply, into ~/.claude/backups/; only the index files,
                  never a transcript. A backup that does not contain every file
@@ -2692,7 +2886,7 @@ duration units:  s=seconds m=minutes h=hours d=days (case-insensitive)
 
 
 def main():
-    global QUIET
+    global QUIET, LOCK_WAIT
     # Session titles and paths can hold any character. Under a non-UTF-8
     # locale (ISO8859-1, US-ASCII, SJIS...) printing one used to raise
     # UnicodeEncodeError and abort the dry run or --restore before it did
@@ -2730,12 +2924,17 @@ def main():
                     help="remove the background job")
     ap.add_argument("--status", action="store_true",
                     help="interval, deletion mode, run count, recent log lines")
+    ap.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
+                    help="if another sync is running, wait up to this long "
+                         "for it instead of giving up at once (default 0, "
+                         "capped at 300)")
     ap.add_argument("--restore-list", dest="restore_list", action="store_true",
                     help="list the available automatic backups")
     ap.add_argument("--restore", metavar="TIMESTAMP",
                     help="copy a backup's files back into the matching stores")
     a = ap.parse_args()
     QUIET = a.quiet
+    LOCK_WAIT = max(0.0, min(float(a.wait or 0.0), 300.0))
     # OPT-IN. The default may not remove anything, so the flag has to be
     # asked for; --no-delete is only the old name of the default.
     do_delete = bool(a.propagate_deletions)
